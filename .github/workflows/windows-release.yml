@@ -6,7 +6,7 @@ on:
       tag:
         description: Draft release tag to upload assets to
         required: true
-        default: v1.0.0
+        default: v1.1.0
 
 permissions:
   contents: write
@@ -48,38 +48,42 @@ jobs:
       - name: Package ZIP
         shell: pwsh
         run: |
-          $package = "release/X-Space-Recorder-1.0.0-Windows"
+          $version = "${{ inputs.tag }}" -replace "^v", ""
+          $baseName = "X-Space-Recorder-$version-Windows"
+          $package = "release/$baseName"
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item "dist/X Space Recorder.exe" $package
           Copy-Item "配布版の使い方.txt" $package
           Copy-Item README.md, LICENSE, SECURITY.md, THIRD_PARTY_NOTICES.md $package
           Compress-Archive `
             -Path "$package/*" `
-            -DestinationPath "release/X-Space-Recorder-1.0.0-Windows.zip" `
+            -DestinationPath "release/$baseName.zip" `
             -CompressionLevel Optimal `
             -Force
           $hash = Get-FileHash `
             -Algorithm SHA256 `
-            -Path "release/X-Space-Recorder-1.0.0-Windows.zip"
+            -Path "release/$baseName.zip"
           Set-Content `
-            -Path "release/X-Space-Recorder-1.0.0-Windows.zip.sha256.txt" `
-            -Value "$($hash.Hash)  X-Space-Recorder-1.0.0-Windows.zip" `
+            -Path "release/$baseName.zip.sha256.txt" `
+            -Value "$($hash.Hash)  $baseName.zip" `
             -Encoding ascii
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
-          name: X-Space-Recorder-1.0.0-Windows
+          name: X-Space-Recorder-${{ inputs.tag }}-Windows
           path: |
-            release/X-Space-Recorder-1.0.0-Windows.zip
-            release/X-Space-Recorder-1.0.0-Windows.zip.sha256.txt
+            release/*.zip
+            release/*.zip.sha256.txt
 
       - name: Upload release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $version = "${{ inputs.tag }}" -replace "^v", ""
+          $baseName = "X-Space-Recorder-$version-Windows"
           gh release upload "${{ inputs.tag }}" `
-            "release/X-Space-Recorder-1.0.0-Windows.zip" `
-            "release/X-Space-Recorder-1.0.0-Windows.zip.sha256.txt" `
+            "release/$baseName.zip" `
+            "release/$baseName.zip.sha256.txt" `
             --clobber

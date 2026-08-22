@@ -18,6 +18,7 @@ from typing import Callable
 
 SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)_a\.aac(?:\?|$)")
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+HISTORY_REPAIR_INTERVAL_SECONDS = 5.0
 
 
 class SpaceArchiveError(RuntimeError):
@@ -51,6 +52,7 @@ class SpaceArchiveSession:
         self.thread: threading.Thread | None = None
         self._claim_lock = threading.Lock()
         self._claimed: set[int] = set()
+        self._known_segments: dict[int, str] = {}
         self._downloaded = 0
         self._temp_dir: Path | None = None
 
@@ -150,6 +152,32 @@ class SpaceArchiveSession:
         assert self._temp_dir is not None
         return self._temp_dir / f"{sequence:09d}.aac"
 
+    def _remember_segments(self, segments: list[tuple[int, str]]) -> None:
+        with self._claim_lock:
+            for sequence, url in segments:
+                self._known_segments[sequence] = url
+
+    def _missing_known_segments(self) -> list[tuple[int, str]]:
+        with self._claim_lock:
+            known = sorted(self._known_segments.items())
+            claimed = self._claimed.copy()
+        return [
+            (sequence, url)
+            for sequence, url in known
+            if sequence not in claimed and not self._segment_path(sequence).is_file()
+        ]
+
+    def _download_batch(self, segments: list[tuple[int, str]], *, workers: int = 8) -> int:
+        failures = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="space-audio") as executor:
+            futures = [executor.submit(self._download_segment, sequence, url) for sequence, url in segments]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    failures += 1
+        return failures
+
     def _download_segment(self, sequence: int, url: str) -> bool:
         target = self._segment_path(sequence)
         with self._claim_lock:
@@ -185,20 +213,14 @@ class SpaceArchiveSession:
         segments = self.parse_playlist(playlist_url, body)
         if not segments:
             raise SpaceArchiveError("過去音声チャンクが見つかりませんでした")
+        self._remember_segments(segments)
         duration = sum(
             float(line.partition(":")[2].rstrip(","))
             for line in body.splitlines()
             if line.startswith("#EXTINF:")
         )
         self._log(f"過去音声を取得: {len(segments)}チャンク（約{duration / 60:.1f}分）")
-        failures = 0
-        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="space-history") as executor:
-            futures = [executor.submit(self._download_segment, sequence, url) for sequence, url in segments]
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception:
-                    failures += 1
+        failures = self._download_batch(segments)
         if failures:
             self._log(f"過去音声の再試行対象: {failures}チャンク")
             retry_segments = [item for item in segments if not self._segment_path(item[0]).is_file()]
@@ -209,14 +231,55 @@ class SpaceArchiveSession:
         else:
             self._log("公開リプレイの取り込みが完了しました。")
 
+    def _repair_history_once(self, playlist_url: str, *, final: bool = False) -> int:
+        body = str(self._read_url(playlist_url))
+        segments = self.parse_playlist(playlist_url, body)
+        if not segments:
+            raise SpaceArchiveError("補完用の履歴プレイリストが空です")
+        self._remember_segments(segments)
+        missing = self._missing_known_segments()
+        if not missing:
+            return 0
+
+        stage = "最終補完" if final else "自動補完"
+        self._log(f"欠落を検知: {len(missing)}チャンクを{stage}します…")
+        failures = self._download_batch(missing)
+        remaining = self._missing_known_segments()
+        repaired = len(missing) - len(remaining)
+        if repaired:
+            self._log(f"{stage}完了: {repaired}チャンクを回収しました")
+        if failures or remaining:
+            self._log(
+                f"{stage}待ち: {len(remaining)}チャンク。"
+                "配信中は履歴を再確認して再試行します"
+            )
+        return repaired
+
+    def _poll_history_repairs(self, playlist_url: str) -> None:
+        consecutive_errors = 0
+        while not self.stop_event.wait(HISTORY_REPAIR_INTERVAL_SECONDS):
+            try:
+                self._repair_history_once(playlist_url)
+                consecutive_errors = 0
+            except Exception as exc:
+                consecutive_errors += 1
+                if consecutive_errors in (1, 5):
+                    self._log(f"履歴の自動補完待ち: {exc}")
+
     def _poll_live(self, dynamic_url: str) -> None:
         consecutive_errors = 0
         while not self.stop_event.is_set():
             try:
                 body = str(self._read_url(dynamic_url))
-                for sequence, url in self.parse_playlist(dynamic_url, body):
+                segments = self.parse_playlist(dynamic_url, body)
+                self._remember_segments(segments)
+                for sequence, url in segments:
                     self._download_segment(sequence, url)
                 consecutive_errors = 0
+                if "#EXT-X-ENDLIST" in body:
+                    self._log("Spaceの終了を検知しました。最終補完を開始します。")
+                    self.stop_event.set()
+                    break
             except Exception as exc:
                 consecutive_errors += 1
                 if consecutive_errors in (1, 5):
@@ -224,7 +287,9 @@ class SpaceArchiveSession:
             self.stop_event.wait(1.5)
         try:
             body = str(self._read_url(dynamic_url))
-            for sequence, url in self.parse_playlist(dynamic_url, body):
+            segments = self.parse_playlist(dynamic_url, body)
+            self._remember_segments(segments)
+            for sequence, url in segments:
                 self._download_segment(sequence, url)
         except Exception:
             pass
@@ -249,12 +314,20 @@ class SpaceArchiveSession:
         if not segments:
             raise SpaceArchiveError("保存できる音声チャンクがありません")
         numbers = [int(path.stem) for path in segments]
-        missing = (numbers[-1] - numbers[0] + 1) - len(numbers)
-        if missing:
+        with self._claim_lock:
+            known_numbers = set(self._known_segments)
+        unresolved = len(known_numbers.difference(numbers))
+        if unresolved:
             self._log(
-                f"警告: Xの配信データ上で{missing}個の音声チャンク番号が欠けています。"
+                f"警告: 履歴上で確認できた{unresolved}個の音声チャンクを補完できませんでした。"
                 "欠落部分は無音を追加せず、前後をつないで保存します"
             )
+        if known_numbers:
+            source_gaps = (max(known_numbers) - min(known_numbers) + 1) - len(known_numbers)
+            if source_gaps:
+                self._log(
+                    f"注意: Xが公開した履歴自体に{source_gaps}個のチャンク番号の飛びがあります"
+                )
 
         combined_aac = self._temp_dir / "combined.aac"
         with combined_aac.open("wb") as combined:
@@ -318,8 +391,19 @@ class SpaceArchiveSession:
                 poller = threading.Thread(target=self._poll_live, args=(stream_url,), daemon=True)
                 poller.start()
                 self._download_history(replay_url, continuing_live=True)
+                repairer = threading.Thread(
+                    target=self._poll_history_repairs,
+                    args=(replay_url,),
+                    daemon=True,
+                )
+                repairer.start()
                 self.stop_event.wait()
                 poller.join(timeout=10)
+                repairer.join(timeout=10)
+                try:
+                    self._repair_history_once(replay_url, final=True)
+                except Exception as exc:
+                    self._log(f"最終補完用の履歴を確認できませんでした: {exc}")
             elif live_status in ("was_live", "post_live"):
                 self._log("終了済みSpaceの公開リプレイを取得します。")
                 self._download_history(stream_url)

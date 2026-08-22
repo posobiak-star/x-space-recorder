@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import shutil
@@ -17,7 +18,7 @@ import recorder
 
 
 APP_NAME = "X Space Recorder"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def default_recordings_dir() -> Path:
@@ -29,6 +30,15 @@ def default_recordings_dir() -> Path:
 
 
 DEFAULT_RECORDINGS = default_recordings_dir()
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_system_awake(enabled: bool) -> None:
+    if os.name != "nt":
+        return
+    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED if enabled else ES_CONTINUOUS
+    ctypes.windll.kernel32.SetThreadExecutionState(flags)
 FORMAT_OPTIONS = {
     "Source（推奨・M4A）": (
         "source",
@@ -293,7 +303,11 @@ class RecorderApp:
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("履歴＋ライブ取得中")
-        self.append_log(f"録音開始: {url}\n保存先: {output}\n")
+        keep_system_awake(True)
+        self.append_log(
+            f"録音開始: {url}\n保存先: {output}\n"
+            "録音中はWindowsの自動スリープを抑止します。\n"
+        )
         self.session.start()
 
     def stop_recording(self) -> None:
@@ -312,6 +326,7 @@ class RecorderApp:
                 if event == "log":
                     self.append_log(str(value))
                 elif event == "done":
+                    keep_system_awake(False)
                     success, path, error = value
                     self.session = None
                     self.start_button.configure(state="normal")
@@ -324,6 +339,7 @@ class RecorderApp:
                     if self.close_when_done:
                         self.root.destroy()
                 elif event == "error":
+                    keep_system_awake(False)
                     self.session = None
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")

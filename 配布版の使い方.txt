@@ -1,4 +1,4 @@
-X Space Recorder 1.0.0
+X Space Recorder 1.1.0
 ======================
 
 1. ZIPを右クリックして「すべて展開」します。

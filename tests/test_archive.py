@@ -66,6 +66,81 @@ segment.aac
                 root / "Space名 (2).m4a",
             )
 
+    def test_missing_known_segments_only_returns_entries_present_in_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=lambda _: None,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            session._remember_segments([(10, "ten"), (11, "eleven"), (13, "thirteen")])
+            session._segment_path(10).write_bytes(b"audio")
+            session._segment_path(13).write_bytes(b"audio")
+
+            self.assertEqual(session._missing_known_segments(), [(11, "eleven")])
+
+    def test_repair_history_downloads_missing_segment_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=logs.append,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            session._remember_segments([(41, "https://cdn.example/41.aac")])
+
+            playlist = """#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:41
+#EXTINF:3.0,
+41.aac
+#EXTINF:3.0,
+42.aac
+"""
+
+            def read_url(_url, *, binary=False):
+                return b"audio" if binary else playlist
+
+            with patch.object(session, "_read_url", side_effect=read_url):
+                repaired = session._repair_history_once("https://cdn.example/replay.m3u8")
+
+            self.assertEqual(repaired, 2)
+            self.assertTrue(session._segment_path(41).is_file())
+            self.assertTrue(session._segment_path(42).is_file())
+            self.assertTrue(any("自動補完完了" in message for message in logs))
+
+    def test_live_endlist_triggers_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=lambda _: None,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            with patch.object(session, "_read_url", return_value="#EXTM3U\n#EXT-X-ENDLIST\n"):
+                session._poll_live("https://cdn.example/live.m3u8")
+
+            self.assertTrue(session.stop_event.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()
