@@ -1,0 +1,334 @@
+"""Backfill and continuously archive X Space HLS audio segments."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Callable
+
+
+SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)_a\.aac(?:\?|$)")
+INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+class SpaceArchiveError(RuntimeError):
+    pass
+
+
+class SpaceArchiveSession:
+    def __init__(
+        self,
+        *,
+        url: str,
+        space_id: str,
+        output_dir: Path,
+        audio_format: str,
+        browser: str | None,
+        ytdlp_prefix: list[str],
+        ffmpeg_location: str,
+        on_log: Callable[[str], None],
+        on_done: Callable[[bool, Path | None, str | None], None],
+    ) -> None:
+        self.url = url
+        self.space_id = space_id
+        self.output_dir = output_dir
+        self.audio_format = audio_format
+        self.browser = browser
+        self.ytdlp_prefix = ytdlp_prefix
+        self.ffmpeg_location = Path(ffmpeg_location)
+        self.on_log = on_log
+        self.on_done = on_done
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._claim_lock = threading.Lock()
+        self._claimed: set[int] = set()
+        self._downloaded = 0
+        self._temp_dir: Path | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
+
+    def _log(self, message: str) -> None:
+        self.on_log(message.rstrip() + "\n")
+
+    def _extract_info(self) -> dict:
+        command = [
+            *self.ytdlp_prefix,
+            "--ignore-config",
+            "--no-download",
+            "--dump-single-json",
+        ]
+        if self.browser:
+            command.extend(["--cookies-from-browser", self.browser])
+        command.extend(["--", self.url])
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "取得情報なし"
+            raise SpaceArchiveError(f"Space情報を取得できませんでした: {detail}")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise SpaceArchiveError("Space情報の応答を解析できませんでした") from exc
+
+    @staticmethod
+    def _read_url(url: str, *, binary: bool = False) -> str | bytes:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Referer": "https://x.com/",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = response.read()
+        return data if binary else data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def parse_playlist(playlist_url: str, body: str) -> list[tuple[int, str]]:
+        media_sequence = 0
+        entries: list[tuple[int, str]] = []
+        fallback_index = 0
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    media_sequence = int(line.partition(":")[2])
+                except ValueError:
+                    media_sequence = 0
+            elif line and not line.startswith("#") and ".m3u8" not in line:
+                match = SEGMENT_SEQUENCE_RE.search(line)
+                sequence = int(match.group(1)) if match else media_sequence + fallback_index
+                entries.append((sequence, urllib.parse.urljoin(playlist_url, line)))
+                fallback_index += 1
+        return entries
+
+    def _derive_live_replay_url(self, dynamic_url: str) -> str:
+        if "dynamic_playlist.m3u8" not in dynamic_url:
+            raise SpaceArchiveError("ライブ履歴プレイリストを特定できませんでした")
+        master_url = re.sub(r"dynamic_playlist\.m3u8(?:\?type=live)?$", "master_playlist.m3u8", dynamic_url)
+        master = str(self._read_url(master_url))
+        playlist_paths = [
+            line.strip()
+            for line in master.splitlines()
+            if line.strip() and not line.startswith("#") and ".m3u8" in line
+        ]
+        if not playlist_paths:
+            raise SpaceArchiveError("ライブ履歴のマスタープレイリストが空です")
+        playlist_name = Path(urllib.parse.urlparse(playlist_paths[0]).path).name
+        return re.sub(
+            r"dynamic_playlist\.m3u8(?:\?type=live)?$",
+            f"{playlist_name}?type=replay",
+            dynamic_url,
+        )
+
+    def _segment_path(self, sequence: int) -> Path:
+        assert self._temp_dir is not None
+        return self._temp_dir / f"{sequence:09d}.aac"
+
+    def _download_segment(self, sequence: int, url: str) -> bool:
+        target = self._segment_path(sequence)
+        with self._claim_lock:
+            if target.is_file() or sequence in self._claimed:
+                return False
+            self._claimed.add(sequence)
+        try:
+            for attempt in range(5):
+                try:
+                    data = self._read_url(url, binary=True)
+                    if not data:
+                        raise OSError("empty segment")
+                    temporary = target.with_suffix(".tmp")
+                    temporary.write_bytes(data)
+                    temporary.replace(target)
+                    with self._claim_lock:
+                        self._downloaded += 1
+                        count = self._downloaded
+                    if count % 100 == 0:
+                        self._log(f"音声チャンク取得済み: {count}")
+                    return True
+                except Exception:
+                    if attempt == 4:
+                        raise
+                    time.sleep(min(2**attempt, 8))
+        finally:
+            with self._claim_lock:
+                self._claimed.discard(sequence)
+        return False
+
+    def _download_history(self, playlist_url: str, *, continuing_live: bool = False) -> None:
+        body = str(self._read_url(playlist_url))
+        segments = self.parse_playlist(playlist_url, body)
+        if not segments:
+            raise SpaceArchiveError("過去音声チャンクが見つかりませんでした")
+        duration = sum(
+            float(line.partition(":")[2].rstrip(","))
+            for line in body.splitlines()
+            if line.startswith("#EXTINF:")
+        )
+        self._log(f"過去音声を取得: {len(segments)}チャンク（約{duration / 60:.1f}分）")
+        failures = 0
+        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="space-history") as executor:
+            futures = [executor.submit(self._download_segment, sequence, url) for sequence, url in segments]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    failures += 1
+        if failures:
+            self._log(f"過去音声の再試行対象: {failures}チャンク")
+            retry_segments = [item for item in segments if not self._segment_path(item[0]).is_file()]
+            for sequence, url in retry_segments:
+                self._download_segment(sequence, url)
+        if continuing_live:
+            self._log("過去音声の取り込みが完了しました。ライブ音声を継続取得中です。")
+        else:
+            self._log("公開リプレイの取り込みが完了しました。")
+
+    def _poll_live(self, dynamic_url: str) -> None:
+        consecutive_errors = 0
+        while not self.stop_event.is_set():
+            try:
+                body = str(self._read_url(dynamic_url))
+                for sequence, url in self.parse_playlist(dynamic_url, body):
+                    self._download_segment(sequence, url)
+                consecutive_errors = 0
+            except Exception as exc:
+                consecutive_errors += 1
+                if consecutive_errors in (1, 5):
+                    self._log(f"ライブ更新待ち: {exc}")
+            self.stop_event.wait(1.5)
+        try:
+            body = str(self._read_url(dynamic_url))
+            for sequence, url in self.parse_playlist(dynamic_url, body):
+                self._download_segment(sequence, url)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_title(value: str) -> str:
+        cleaned = INVALID_FILENAME_RE.sub("_", value).strip(" .")
+        return cleaned[:100] or "X Space"
+
+    @staticmethod
+    def _unique_output_path(directory: Path, title: str, extension: str) -> Path:
+        candidate = directory / f"{title}.{extension}"
+        counter = 2
+        while candidate.exists():
+            candidate = directory / f"{title} ({counter}).{extension}"
+            counter += 1
+        return candidate
+
+    def _finalize(self, title: str) -> Path:
+        assert self._temp_dir is not None
+        segments = sorted(self._temp_dir.glob("*.aac"), key=lambda path: int(path.stem))
+        if not segments:
+            raise SpaceArchiveError("保存できる音声チャンクがありません")
+        numbers = [int(path.stem) for path in segments]
+        missing = (numbers[-1] - numbers[0] + 1) - len(numbers)
+        if missing:
+            self._log(
+                f"警告: Xの配信データ上で{missing}個の音声チャンク番号が欠けています。"
+                "欠落部分は無音を追加せず、前後をつないで保存します"
+            )
+
+        combined_aac = self._temp_dir / "combined.aac"
+        with combined_aac.open("wb") as combined:
+            for segment in segments:
+                with segment.open("rb") as source:
+                    shutil.copyfileobj(source, combined, length=1024 * 1024)
+        extension = "m4a" if self.audio_format in ("source", "m4a") else self.audio_format
+        output = self._unique_output_path(
+            self.output_dir,
+            self._safe_title(title),
+            extension,
+        )
+        codec_args = ["-vn", "-c:a", "copy"]
+        if extension == "mp3":
+            codec_args = ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
+        elif extension == "wav":
+            codec_args = ["-vn", "-c:a", "pcm_s16le"]
+        elif extension == "opus":
+            codec_args = ["-vn", "-c:a", "libopus"]
+        self._log(f"{len(segments)}チャンクを音声ファイルへ結合しています…")
+        result = subprocess.run(
+            [
+                str(self.ffmpeg_location / "ffmpeg.exe"),
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "aac",
+                "-i",
+                str(combined_aac),
+                *codec_args,
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            check=False,
+        )
+        if result.returncode or not output.is_file():
+            raise SpaceArchiveError(f"音声ファイルの結合に失敗しました: {result.stderr.strip()}")
+        shutil.rmtree(self._temp_dir)
+        return output
+
+    def _run(self) -> None:
+        output: Path | None = None
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            info = self._extract_info()
+            title = str(info.get("fulltitle") or info.get("title") or "X Space")
+            live_status = str(info.get("live_status") or "")
+            stream_url = str(info.get("url") or "")
+            self._temp_dir = self.output_dir / f".recording-{self.space_id}-{int(time.time())}"
+            self._temp_dir.mkdir(parents=True, exist_ok=False)
+            self._log(f"Space: {title}")
+
+            if live_status == "is_live":
+                replay_url = self._derive_live_replay_url(stream_url)
+                self._log("ライブ開始前まで遡り、現在音声を並行取得します。")
+                poller = threading.Thread(target=self._poll_live, args=(stream_url,), daemon=True)
+                poller.start()
+                self._download_history(replay_url, continuing_live=True)
+                self.stop_event.wait()
+                poller.join(timeout=10)
+            elif live_status in ("was_live", "post_live"):
+                self._log("終了済みSpaceの公開リプレイを取得します。")
+                self._download_history(stream_url)
+            else:
+                raise SpaceArchiveError(f"現在のSpace状態は取得対象外です: {live_status or '不明'}")
+
+            output = self._finalize(title)
+            self._log(f"保存完了: {output}")
+            self.on_done(True, output, None)
+        except Exception as exc:
+            self._log(f"エラー: {exc}")
+            self.on_done(False, output, str(exc))
