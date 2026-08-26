@@ -19,7 +19,7 @@ import recorder
 
 
 APP_NAME = "X Space Recorder"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 FIREFOX_DOWNLOAD_URL = "https://www.mozilla.org/firefox/new/"
 
 
@@ -350,7 +350,7 @@ class RecorderApp:
             return
         self.status.set("停止処理中")
         self.stop_button.configure(state="disabled")
-        self.append_log("録音を停止しています…\n")
+        self.append_log("録音を強制停止します。取得済み分の保存へ進みます…\n")
         session.stop()
 
     def _drain_events(self) -> None:

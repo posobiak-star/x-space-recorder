@@ -1,5 +1,6 @@
-import unittest
 import tempfile
+import threading
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -111,7 +112,7 @@ segment.aac
 42.aac
 """
 
-            def read_url(_url, *, binary=False):
+            def read_url(_url, *, binary=False, timeout=30):
                 return b"audio" if binary else playlist
 
             with patch.object(session, "_read_url", side_effect=read_url):
@@ -140,6 +141,186 @@ segment.aac
                 session._poll_live("https://cdn.example/live.m3u8")
 
             self.assertTrue(session.stop_event.is_set())
+
+    def test_history_endlist_triggers_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=logs.append,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            session._segment_path(50).write_bytes(b"audio")
+            playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:50\n#EXTINF:3.0,\n50.aac\n#EXT-X-ENDLIST\n"
+
+            with patch.object(session, "_read_url", return_value=playlist):
+                session._repair_history_once("https://cdn.example/replay.m3u8")
+
+            self.assertTrue(session.stop_event.is_set())
+            self.assertTrue(any("履歴からSpaceの終了を検知" in message for message in logs))
+
+    def test_initial_history_endlist_triggers_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=logs.append,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:70\n#EXTINF:3.0,\n70.aac\n#EXT-X-ENDLIST\n"
+
+            with (
+                patch.object(session, "_read_url", return_value=playlist),
+                patch.object(session, "_download_batch", return_value=0),
+            ):
+                session._download_history("https://cdn.example/replay.m3u8", continuing_live=True)
+
+            self.assertTrue(session.stop_event.is_set())
+            self.assertTrue(any("履歴からSpaceの終了を検知" in message for message in logs))
+
+    def test_status_check_keeps_live_space_running(self):
+        logs = []
+        session = archive.SpaceArchiveSession(
+            url="https://x.com/i/spaces/abcdefghijklm",
+            space_id="abcdefghijklm",
+            output_dir=Path("out"),
+            audio_format="source",
+            browser=None,
+            ytdlp_prefix=["yt-dlp"],
+            ffmpeg_location="C:/ffmpeg",
+            on_log=logs.append,
+            on_done=lambda *_: None,
+        )
+        live_url = "https://cdn.example/dynamic_playlist.m3u8?type=live"
+        with patch.object(
+            session,
+            "_extract_info",
+            return_value={"live_status": "is_live", "url": live_url},
+        ):
+            result = session._check_space_status()
+            repeated_result = session._check_space_status()
+
+        self.assertEqual(result, "live")
+        self.assertEqual(repeated_result, "live")
+        self.assertFalse(session.stop_event.is_set())
+        self.assertEqual(session._status_live_url, live_url)
+        self.assertEqual(sum("Spaceは進行中" in message for message in logs), 1)
+
+    def test_status_check_ends_with_public_replay(self):
+        session = archive.SpaceArchiveSession(
+            url="https://x.com/i/spaces/abcdefghijklm",
+            space_id="abcdefghijklm",
+            output_dir=Path("out"),
+            audio_format="source",
+            browser=None,
+            ytdlp_prefix=["yt-dlp"],
+            ffmpeg_location="C:/ffmpeg",
+            on_log=lambda _: None,
+            on_done=lambda *_: None,
+        )
+        replay_url = "https://cdn.example/replay.m3u8"
+        with patch.object(
+            session,
+            "_extract_info",
+            return_value={"live_status": "was_live", "url": replay_url},
+        ):
+            result = session._check_space_status()
+
+        self.assertEqual(result, "ended_with_replay")
+        self.assertTrue(session.stop_event.is_set())
+        self.assertEqual(session._status_replay_url, replay_url)
+        self.assertFalse(session._ended_without_replay)
+
+    def test_status_check_ends_without_public_replay(self):
+        session = archive.SpaceArchiveSession(
+            url="https://x.com/i/spaces/abcdefghijklm",
+            space_id="abcdefghijklm",
+            output_dir=Path("out"),
+            audio_format="source",
+            browser=None,
+            ytdlp_prefix=["yt-dlp"],
+            ffmpeg_location="C:/ffmpeg",
+            on_log=lambda _: None,
+            on_done=lambda *_: None,
+        )
+        with patch.object(
+            session,
+            "_extract_info",
+            return_value={"live_status": "was_live", "formats": []},
+        ):
+            result = session._check_space_status()
+
+        self.assertEqual(result, "ended_without_replay")
+        self.assertTrue(session.stop_event.is_set())
+        self.assertTrue(session._ended_without_replay)
+
+    def test_manual_stop_prevents_new_segment_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=lambda _: None,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            session.stop()
+
+            with patch.object(session, "_read_url") as read_url:
+                downloaded = session._download_segment(100, "https://cdn.example/100.aac")
+
+            self.assertFalse(downloaded)
+            read_url.assert_not_called()
+
+    def test_manual_stop_cancels_queued_batch_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=lambda _: None,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            started = threading.Event()
+
+            def read_url(_url, *, binary=False, timeout=30):
+                started.set()
+                session.manual_stop_event.wait(2)
+                return b"audio"
+
+            segments = [(sequence, f"https://cdn.example/{sequence}.aac") for sequence in range(50)]
+            with patch.object(session, "_read_url", side_effect=read_url):
+                worker = threading.Thread(target=session._download_batch, args=(segments,))
+                worker.start()
+                self.assertTrue(started.wait(1))
+                session.stop()
+                worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertLessEqual(len(list(Path(directory).glob("*.aac"))), 8)
 
 
 if __name__ == "__main__":

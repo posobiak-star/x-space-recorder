@@ -19,6 +19,11 @@ from typing import Callable
 SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)_a\.aac(?:\?|$)")
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 HISTORY_REPAIR_INTERVAL_SECONDS = 5.0
+LIVE_POLL_INTERVAL_SECONDS = 1.5
+SEGMENT_REQUEST_TIMEOUT_SECONDS = 10.0
+PLAYLIST_REQUEST_TIMEOUT_SECONDS = 10.0
+LIVE_STATUS_CHECK_AFTER_SECONDS = 30.0
+SPACE_INFO_TIMEOUT_SECONDS = 30.0
 
 
 class SpaceArchiveError(RuntimeError):
@@ -49,18 +54,24 @@ class SpaceArchiveSession:
         self.on_log = on_log
         self.on_done = on_done
         self.stop_event = threading.Event()
+        self.manual_stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self._claim_lock = threading.Lock()
         self._claimed: set[int] = set()
         self._known_segments: dict[int, str] = {}
         self._downloaded = 0
         self._temp_dir: Path | None = None
+        self._status_replay_url: str | None = None
+        self._status_live_url: str | None = None
+        self._ended_without_replay = False
+        self._last_status_result: str | None = None
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
+        self.manual_stop_event.set()
         self.stop_event.set()
 
     @property
@@ -70,35 +81,80 @@ class SpaceArchiveSession:
     def _log(self, message: str) -> None:
         self.on_log(message.rstrip() + "\n")
 
-    def _extract_info(self) -> dict:
+    def _extract_info(self, *, allow_no_formats: bool = False) -> dict:
         command = [
             *self.ytdlp_prefix,
             "--ignore-config",
             "--no-download",
             "--dump-single-json",
         ]
+        if allow_no_formats:
+            command.append("--ignore-no-formats-error")
         if self.browser:
             command.extend(["--cookies-from-browser", self.browser])
         command.extend(["--", self.url])
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            check=False,
         )
-        if result.returncode:
-            detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "取得情報なし"
+        deadline = time.monotonic() + SPACE_INFO_TIMEOUT_SECONDS
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if self.manual_stop_event.is_set():
+                    process.kill()
+                    process.communicate()
+                    raise SpaceArchiveError("録音停止によりSpace情報の確認を中断しました")
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.communicate()
+                    raise SpaceArchiveError("Space情報の確認が30秒以内に完了しませんでした")
+        if process.returncode:
+            detail = stderr.strip().splitlines()[-1] if stderr.strip() else "取得情報なし"
             raise SpaceArchiveError(f"Space情報を取得できませんでした: {detail}")
         try:
-            return json.loads(result.stdout)
+            return json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise SpaceArchiveError("Space情報の応答を解析できませんでした") from exc
 
+    def _check_space_status(self) -> str:
+        """Refresh Space metadata without assuming that a stalled playlist means ended."""
+        info = self._extract_info(allow_no_formats=True)
+        live_status = str(info.get("live_status") or "")
+        replay_url = str(info.get("url") or "")
+        if live_status == "is_live":
+            self._status_live_url = replay_url or None
+            if self._last_status_result != "live":
+                self._log("状態確認: Spaceは進行中です。ライブ取得を再試行します。")
+            self._last_status_result = "live"
+            return "live"
+        if live_status in ("was_live", "post_live"):
+            self._status_replay_url = replay_url or None
+            self._ended_without_replay = not bool(replay_url)
+            if replay_url:
+                self._log("状態確認: Space終了・公開リプレイあり。最終補完を開始します。")
+                result = "ended_with_replay"
+            else:
+                self._log("状態確認: Space終了・公開リプレイなし。取得済み分を保存します。")
+                result = "ended_without_replay"
+            self._last_status_result = result
+            self.stop_event.set()
+            return result
+        result = f"other:{live_status or 'unknown'}"
+        if self._last_status_result != result:
+            self._log(f"状態確認: Spaceは終了していません（{live_status or '状態不明'}）。")
+        self._last_status_result = result
+        return "other"
+
     @staticmethod
-    def _read_url(url: str, *, binary: bool = False) -> str | bytes:
+    def _read_url(url: str, *, binary: bool = False, timeout: float = 30) -> str | bytes:
         request = urllib.request.Request(
             url,
             headers={
@@ -106,7 +162,7 @@ class SpaceArchiveSession:
                 "Referer": "https://x.com/",
             },
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = response.read()
         return data if binary else data.decode("utf-8", errors="replace")
 
@@ -179,6 +235,8 @@ class SpaceArchiveSession:
         return failures
 
     def _download_segment(self, sequence: int, url: str) -> bool:
+        if self.manual_stop_event.is_set():
+            return False
         target = self._segment_path(sequence)
         with self._claim_lock:
             if target.is_file() or sequence in self._claimed:
@@ -186,8 +244,14 @@ class SpaceArchiveSession:
             self._claimed.add(sequence)
         try:
             for attempt in range(5):
+                if self.manual_stop_event.is_set():
+                    return False
                 try:
-                    data = self._read_url(url, binary=True)
+                    data = self._read_url(
+                        url,
+                        binary=True,
+                        timeout=SEGMENT_REQUEST_TIMEOUT_SECONDS,
+                    )
                     if not data:
                         raise OSError("empty segment")
                     temporary = target.with_suffix(".tmp")
@@ -200,20 +264,25 @@ class SpaceArchiveSession:
                         self._log(f"音声チャンク取得済み: {count}")
                     return True
                 except Exception:
+                    if self.manual_stop_event.is_set():
+                        return False
                     if attempt == 4:
                         raise
-                    time.sleep(min(2**attempt, 8))
+                    self.manual_stop_event.wait(min(2**attempt, 8))
         finally:
             with self._claim_lock:
                 self._claimed.discard(sequence)
         return False
 
     def _download_history(self, playlist_url: str, *, continuing_live: bool = False) -> None:
-        body = str(self._read_url(playlist_url))
+        body = str(self._read_url(playlist_url, timeout=PLAYLIST_REQUEST_TIMEOUT_SECONDS))
         segments = self.parse_playlist(playlist_url, body)
         if not segments:
             raise SpaceArchiveError("過去音声チャンクが見つかりませんでした")
         self._remember_segments(segments)
+        if continuing_live and "#EXT-X-ENDLIST" in body and not self.stop_event.is_set():
+            self._log("履歴からSpaceの終了を検知しました。最終補完を開始します。")
+            self.stop_event.set()
         duration = sum(
             float(line.partition(":")[2].rstrip(","))
             for line in body.splitlines()
@@ -221,22 +290,33 @@ class SpaceArchiveSession:
         )
         self._log(f"過去音声を取得: {len(segments)}チャンク（約{duration / 60:.1f}分）")
         failures = self._download_batch(segments)
+        if self.manual_stop_event.is_set():
+            return
         if failures:
             self._log(f"過去音声の再試行対象: {failures}チャンク")
             retry_segments = [item for item in segments if not self._segment_path(item[0]).is_file()]
             for sequence, url in retry_segments:
                 self._download_segment(sequence, url)
-        if continuing_live:
+        if continuing_live and self.stop_event.is_set():
+            self._log("過去音声の取り込みが完了しました。Space終了処理へ進みます。")
+        elif continuing_live:
             self._log("過去音声の取り込みが完了しました。ライブ音声を継続取得中です。")
         else:
             self._log("公開リプレイの取り込みが完了しました。")
 
     def _repair_history_once(self, playlist_url: str, *, final: bool = False) -> int:
-        body = str(self._read_url(playlist_url))
+        if self.manual_stop_event.is_set():
+            return 0
+        body = str(self._read_url(playlist_url, timeout=PLAYLIST_REQUEST_TIMEOUT_SECONDS))
+        if self.manual_stop_event.is_set():
+            return 0
         segments = self.parse_playlist(playlist_url, body)
         if not segments:
             raise SpaceArchiveError("補完用の履歴プレイリストが空です")
         self._remember_segments(segments)
+        if "#EXT-X-ENDLIST" in body and not self.stop_event.is_set():
+            self._log("履歴からSpaceの終了を検知しました。最終補完を開始します。")
+            self.stop_event.set()
         missing = self._missing_known_segments()
         if not missing:
             return 0
@@ -268,15 +348,27 @@ class SpaceArchiveSession:
 
     def _poll_live(self, dynamic_url: str) -> None:
         consecutive_errors = 0
+        latest_sequence: int | None = None
+        last_progress_at = time.monotonic()
+        last_status_check_at = 0.0
+        status_check_errors = 0
         while not self.stop_event.is_set():
             try:
-                body = str(self._read_url(dynamic_url))
+                body = str(self._read_url(dynamic_url, timeout=PLAYLIST_REQUEST_TIMEOUT_SECONDS))
                 segments = self.parse_playlist(dynamic_url, body)
                 self._remember_segments(segments)
                 for sequence, url in segments:
                     self._download_segment(sequence, url)
                 consecutive_errors = 0
-                if "#EXT-X-ENDLIST" in body:
+                current_sequence = max((sequence for sequence, _ in segments), default=None)
+                if current_sequence is not None and (
+                    latest_sequence is None or current_sequence > latest_sequence
+                ):
+                    latest_sequence = current_sequence
+                    last_progress_at = time.monotonic()
+                    status_check_errors = 0
+                    self._last_status_result = None
+                if "#EXT-X-ENDLIST" in body and not self.stop_event.is_set():
                     self._log("Spaceの終了を検知しました。最終補完を開始します。")
                     self.stop_event.set()
                     break
@@ -284,15 +376,32 @@ class SpaceArchiveSession:
                 consecutive_errors += 1
                 if consecutive_errors in (1, 5):
                     self._log(f"ライブ更新待ち: {exc}")
-            self.stop_event.wait(1.5)
-        try:
-            body = str(self._read_url(dynamic_url))
-            segments = self.parse_playlist(dynamic_url, body)
-            self._remember_segments(segments)
-            for sequence, url in segments:
-                self._download_segment(sequence, url)
-        except Exception:
-            pass
+            now = time.monotonic()
+            if (
+                not self.stop_event.is_set()
+                and now - last_progress_at >= LIVE_STATUS_CHECK_AFTER_SECONDS
+                and now - last_status_check_at >= LIVE_STATUS_CHECK_AFTER_SECONDS
+            ):
+                last_status_check_at = now
+                try:
+                    status = self._check_space_status()
+                    status_check_errors = 0
+                    if status == "live" and self._status_live_url:
+                        dynamic_url = self._status_live_url
+                except Exception as exc:
+                    status_check_errors += 1
+                    if status_check_errors in (1, 5):
+                        self._log(f"Space状態の再確認待ち: {exc}")
+            self.stop_event.wait(LIVE_POLL_INTERVAL_SECONDS)
+        if not self.manual_stop_event.is_set():
+            try:
+                body = str(self._read_url(dynamic_url, timeout=PLAYLIST_REQUEST_TIMEOUT_SECONDS))
+                segments = self.parse_playlist(dynamic_url, body)
+                self._remember_segments(segments)
+                for sequence, url in segments:
+                    self._download_segment(sequence, url)
+            except Exception:
+                pass
 
     @staticmethod
     def _safe_title(value: str) -> str:
@@ -377,7 +486,7 @@ class SpaceArchiveSession:
         output: Path | None = None
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            info = self._extract_info()
+            info = self._extract_info(allow_no_formats=True)
             title = str(info.get("fulltitle") or info.get("title") or "X Space")
             live_status = str(info.get("live_status") or "")
             stream_url = str(info.get("url") or "")
@@ -391,20 +500,34 @@ class SpaceArchiveSession:
                 poller = threading.Thread(target=self._poll_live, args=(stream_url,), daemon=True)
                 poller.start()
                 self._download_history(replay_url, continuing_live=True)
-                repairer = threading.Thread(
-                    target=self._poll_history_repairs,
-                    args=(replay_url,),
-                    daemon=True,
-                )
-                repairer.start()
+                repairer: threading.Thread | None = None
+                if not self.stop_event.is_set():
+                    repairer = threading.Thread(
+                        target=self._poll_history_repairs,
+                        args=(replay_url,),
+                        daemon=True,
+                    )
+                    repairer.start()
                 self.stop_event.wait()
-                poller.join(timeout=10)
-                repairer.join(timeout=10)
-                try:
-                    self._repair_history_once(replay_url, final=True)
-                except Exception as exc:
-                    self._log(f"最終補完用の履歴を確認できませんでした: {exc}")
+                poller.join()
+                if repairer:
+                    repairer.join()
+                if self.manual_stop_event.is_set():
+                    self._log("録音を強制停止しました。最終補完を省略して保存します。")
+                elif not self._ended_without_replay:
+                    try:
+                        self._repair_history_once(
+                            self._status_replay_url or replay_url,
+                            final=True,
+                        )
+                    except Exception as exc:
+                        self._log(f"最終補完用の履歴を確認できませんでした: {exc}")
             elif live_status in ("was_live", "post_live"):
+                if not stream_url:
+                    raise SpaceArchiveError(
+                        "終了済みSpaceですが、公開リプレイがありません。"
+                        "ホストが録音を残していないか、リプレイが削除されています"
+                    )
                 self._log("終了済みSpaceの公開リプレイを取得します。")
                 self._download_history(stream_url)
             else:

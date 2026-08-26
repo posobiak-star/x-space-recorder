@@ -98,8 +98,12 @@ def main() -> int:
 
         original_read_url = session._read_url
 
-        def frozen_playlist(url_to_read: str, *, binary: bool = False):
-            return original_read_url(url_to_read, binary=True) if binary else playlist
+        def frozen_playlist(url_to_read: str, *, binary: bool = False, timeout: float = 30):
+            return (
+                original_read_url(url_to_read, binary=True, timeout=timeout)
+                if binary
+                else playlist
+            )
 
         with patch.object(session, "_read_url", side_effect=frozen_playlist):
             repairer = threading.Thread(
