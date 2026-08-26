@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth = parser.add_mutually_exclusive_group()
     auth.add_argument(
         "--browser",
-        choices=("chrome", "edge", "firefox", "brave", "chromium"),
+        choices=("firefox",),
         help="ログイン済みブラウザのCookieを利用",
     )
     auth.add_argument("--cookies", type=Path, help="Netscape形式のcookies.txtを利用")
@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"録音開始: {url}")
     print(f"保存先: {output_dir}")
     if not args.browser and not args.cookies:
-        print("認証エラーの場合は --browser chrome（または edge）を追加してください。")
+        print("認証エラーの場合は --browser firefox を追加してください。")
     print("停止: Ctrl+C")
 
     try:
@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     if completed.returncode:
         print(
             "録音に失敗しました。Spaceが進行中か確認し、認証エラーなら "
-            "--browser chrome を付けて再試行してください。",
+            "--browser firefox を付けて再試行してください。",
             file=sys.stderr,
         )
     return completed.returncode

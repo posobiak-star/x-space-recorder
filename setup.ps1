@@ -23,4 +23,4 @@ if ($InstallFfmpeg -and -not (Get-Command ffmpeg -ErrorAction SilentlyContinue))
 
 Write-Host ''
 Write-Host 'セットアップ完了。例:'
-Write-Host '.\record.ps1 https://x.com/i/spaces/SPACE_ID --browser chrome'
+Write-Host '.\record.ps1 https://x.com/i/spaces/SPACE_ID --browser firefox'

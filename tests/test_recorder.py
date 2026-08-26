@@ -50,7 +50,7 @@ class RecorderTests(unittest.TestCase):
             space_id="abc",
             output_dir=Path("out"),
             audio_format="source",
-            browser="chrome",
+            browser="firefox",
             cookies_file=None,
             ffmpeg_location="C:/ffmpeg/bin",
             verbose=False,

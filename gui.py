@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,7 +19,8 @@ import recorder
 
 
 APP_NAME = "X Space Recorder"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+FIREFOX_DOWNLOAD_URL = "https://www.mozilla.org/firefox/new/"
 
 
 def default_recordings_dir() -> Path:
@@ -66,23 +68,24 @@ LOGIN_OPTIONS = {
         None,
         "まずはこちらを選択してください。公開SpaceはXへログインせず取得できる場合があります。",
     ),
-    "Chrome": (
-        "chrome",
-        "ChromeでXにログイン済みの場合、そのCookieをXへの取得リクエストに使用します。パスワード入力は不要です。",
-    ),
-    "Edge": (
-        "edge",
-        "EdgeでXにログイン済みの場合、そのCookieをXへの取得リクエストに使用します。パスワード入力は不要です。",
-    ),
     "Firefox": (
         "firefox",
         "FirefoxでXにログイン済みの場合、そのCookieをXへの取得リクエストに使用します。パスワード入力は不要です。",
     ),
-    "Brave": (
-        "brave",
-        "BraveでXにログイン済みの場合、そのCookieをXへの取得リクエストに使用します。パスワード入力は不要です。",
-    ),
 }
+
+
+def find_firefox() -> Path | None:
+    executable = shutil.which("firefox")
+    if executable:
+        return Path(executable)
+
+    candidates = []
+    for environment_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        root = os.environ.get(environment_name)
+        if root:
+            candidates.append(Path(root) / "Mozilla Firefox" / "firefox.exe")
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def bundled_ytdlp_prefix() -> list[str]:
@@ -173,6 +176,13 @@ class RecorderApp:
             wraplength=310,
             justify="left",
         ).grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        self.firefox_button = ttk.Button(
+            login_panel,
+            text="Firefoxをダウンロード",
+            command=self.open_firefox_download,
+        )
+        self.firefox_button.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self._update_firefox_button()
 
         ttk.Label(outer, text="録音データ保存先").grid(row=4, column=0, sticky="w")
         folder = ttk.Frame(outer)
@@ -218,6 +228,20 @@ class RecorderApp:
         if self.browser.get() != "認証なし":
             description += " 読み取りエラー時はブラウザを完全に終了して再試行してください。"
         self.login_help.set(description)
+        self._update_firefox_button()
+
+    def _update_firefox_button(self) -> None:
+        if self.browser.get() == "Firefox" and not find_firefox():
+            self.firefox_button.grid()
+        else:
+            self.firefox_button.grid_remove()
+
+    def open_firefox_download(self) -> None:
+        if not webbrowser.open(FIREFOX_DOWNLOAD_URL):
+            messagebox.showerror(
+                APP_NAME,
+                f"ブラウザを開けませんでした。次のURLからFirefoxを入手してください。\n\n{FIREFOX_DOWNLOAD_URL}",
+            )
 
     def choose_folder(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir.get(), title="録音データ保存先")
@@ -278,6 +302,16 @@ class RecorderApp:
             url, space_id = recorder.normalize_space_url(self.url.get())
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
+            return
+
+        if self.browser.get() == "Firefox" and not find_firefox():
+            if messagebox.askyesno(
+                APP_NAME,
+                "Firefoxが見つかりません。\n\n"
+                "ログインが必要なSpaceを取得するには、FirefoxをインストールしてXへログインしてください。\n\n"
+                "Firefox公式ダウンロードページを開きますか？",
+            ):
+                self.open_firefox_download()
             return
 
         ffmpeg_location = recorder.find_ffmpeg()

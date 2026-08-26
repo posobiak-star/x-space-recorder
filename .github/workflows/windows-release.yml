@@ -6,7 +6,7 @@ on:
       tag:
         description: Draft release tag to upload assets to
         required: true
-        default: v1.1.0
+        default: v1.2.0
 
 permissions:
   contents: write

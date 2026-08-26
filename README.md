@@ -7,7 +7,7 @@ X SpaceのURLを貼るだけで音声を保存できるWindowsアプリです。
 
 ## ダウンロードして使う
 
-1. GitHubの **Releases** から `X-Space-Recorder-1.1.0-Windows.zip` をダウンロードします。
+1. GitHubの **Releases** から `X-Space-Recorder-1.2.0-Windows.zip` をダウンロードします。
 2. ZIPを右クリックし、**すべて展開**します。
 3. `X Space Recorder.exe` を起動します。
 4. 初回だけ、画面の **FFmpegを導入** を押します。
@@ -62,11 +62,13 @@ X SpaceのURLを貼るだけで音声を保存できるWindowsアプリです。
 | 設定 | 内容 |
 | --- | --- |
 | 認証なし（推奨） | Xへログインせずに取得します。公開Spaceでは、まずこちらを試してください。 |
-| Chrome / Edge / Firefox / Brave | 選択したブラウザでXにログイン済みの場合、そのCookieを利用して取得します。ログインが必要なSpaceや、認証なしでは情報を取得できない場合に使用します。 |
+| Firefox | FirefoxでXにログイン済みの場合、そのCookieを利用します。ログインが必要なSpaceや、認証なしでは取得できない場合に使用します。 |
 
 アプリへXのIDやパスワードを入力する必要はありません。ブラウザCookieはローカルの `yt-dlp` が読み取り、Xへの取得リクエストにのみ使用します。本アプリがCookieを独自に保存したり、第三者へ送信したりすることはありません。
 
-Cookieの読み取りエラーが表示された場合は、選択したブラウザをバックグラウンド動作も含めて完全に終了し、再試行してください。
+Firefoxが入っていない場合は、画面に **Firefoxをダウンロード** ボタンが表示されます。ボタンはMozilla公式ページを開くだけで、Firefoxを勝手にインストールすることはありません。インストール後はFirefoxでXへログインし、Firefoxを完全に終了してから録音を開始してください。
+
+Chrome・Edge・Braveは、WindowsのCookie暗号化仕様によってログイン情報を読み取れない場合があるため、通常画面の選択肢には表示していません。
 
 ### 欠損の自動補完ログ
 
@@ -110,15 +112,15 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 Xへのログインを要求された場合は、ログイン済みブラウザを指定します。
 
 ```powershell
-.\record.ps1 "https://x.com/i/spaces/SPACE_ID" --browser chrome
+.\record.ps1 "https://x.com/i/spaces/SPACE_ID" --browser firefox
 ```
 
-Edgeの場合は `--browser edge` です。ブラウザCookieは `yt-dlp` がローカルで読み取り、このツールが保存・送信することはありません。読み取りに失敗する場合はブラウザを完全に終了して再試行してください。
+FirefoxのCookieは `yt-dlp` がローカルで読み取り、このツールが保存・第三者へ送信することはありません。読み取りに失敗する場合はFirefoxを完全に終了して再試行してください。
 
 既定では元ストリームの形式を保ち、`recordings` に保存します。X SpaceのHLS取得にはFFmpegが必要です。MP3へ変換する例:
 
 ```powershell
-.\record.ps1 "https://x.com/i/spaces/SPACE_ID" --browser chrome --format mp3
+.\record.ps1 "https://x.com/i/spaces/SPACE_ID" --browser firefox --format mp3
 ```
 
 保存先を変える例:
