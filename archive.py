@@ -296,7 +296,11 @@ class SpaceArchiveSession:
             self._log(f"過去音声の再試行対象: {failures}チャンク")
             retry_segments = [item for item in segments if not self._segment_path(item[0]).is_file()]
             for sequence, url in retry_segments:
-                self._download_segment(sequence, url)
+                try:
+                    self._download_segment(sequence, url)
+                except Exception:
+                    # A permanently unavailable chunk must not discard the audio already saved.
+                    pass
         if continuing_live and self.stop_event.is_set():
             self._log("過去音声の取り込みが完了しました。Space終了処理へ進みます。")
         elif continuing_live:
@@ -329,10 +333,13 @@ class SpaceArchiveSession:
         if repaired:
             self._log(f"{stage}完了: {repaired}チャンクを回収しました")
         if failures or remaining:
-            self._log(
-                f"{stage}待ち: {len(remaining)}チャンク。"
-                "配信中は履歴を再確認して再試行します"
-            )
+            if final:
+                self._log(f"最終補完で未取得: {len(remaining)}チャンク")
+            else:
+                self._log(
+                    f"自動補完待ち: {len(remaining)}チャンク。"
+                    "配信中は履歴を再確認して再試行します"
+                )
         return repaired
 
     def _poll_history_repairs(self, playlist_url: str) -> None:

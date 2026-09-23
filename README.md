@@ -7,7 +7,7 @@ X SpaceのURLを貼るだけで音声を保存できるWindowsアプリです。
 
 ## ダウンロードして使う
 
-1. GitHubの **Releases** から `X-Space-Recorder-1.2.1-Windows.zip` をダウンロードします。
+1. [GitHubのReleases](https://github.com/posobiak-star/x-space-recorder/releases/latest) から `X-Space-Recorder-1.2.2-Windows.zip` をダウンロードします。
 2. ZIPを右クリックし、**すべて展開**します。
 3. `X Space Recorder.exe` を起動します。
 4. 初回だけ、画面の **FFmpegを導入** を押します。
@@ -83,6 +83,8 @@ Chrome・Edge・Braveは、WindowsのCookie暗号化仕様によってログイ�
 ```
 
 すぐに回収できないチャンクは、Spaceが続いている間5秒ごとに再試行します。Space終了時には、完全履歴をもう一度確認して「最終補完」を行います。手動停止では待ち時間を避けるため、最終補完を省略して取得済み分を保存します。
+
+再試行しても取得できないチャンクがある場合は警告を表示し、取得済みの音声を保存します。欠落部分は無音で埋めず、前後の音声をつなぎます。
 
 ### 録音停止とSpace終了の検知
 

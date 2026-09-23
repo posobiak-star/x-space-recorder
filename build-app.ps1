@@ -16,6 +16,9 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
 New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
 Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe' -OutFile $YtDlpExe
 & $VenvPython -m pip install --upgrade pyinstaller
+if ($LASTEXITCODE -ne 0) {
+    throw 'PyInstallerのインストールに失敗しました。'
+}
 
 Push-Location $ProjectDir
 try {
@@ -23,6 +26,9 @@ try {
         --name 'X Space Recorder' `
         --add-binary "$YtDlpExe;." `
         gui.py
+    if ($LASTEXITCODE -ne 0) {
+        throw 'アプリのビルドに失敗しました。'
+    }
 } finally {
     Pop-Location
 }
@@ -35,7 +41,7 @@ if ($Install) {
     $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\X Space Recorder'
     $InstalledExe = Join-Path $InstallDir 'X Space Recorder.exe'
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -LiteralPath $DistExe -Destination $InstalledExe -Force
+    Copy-Item -LiteralPath $DistExe -Destination $InstalledExe -Force -ErrorAction Stop
 
     $Desktop = [Environment]::GetFolderPath('Desktop')
     $ShortcutPath = Join-Path $Desktop 'X Space Recorder.lnk'

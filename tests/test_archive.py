@@ -123,6 +123,80 @@ segment.aac
             self.assertTrue(session._segment_path(42).is_file())
             self.assertTrue(any("自動補完完了" in message for message in logs))
 
+    def test_history_retry_failure_does_not_discard_downloaded_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=logs.append,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            playlist = """#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:40
+#EXTINF:3.0,
+40.aac
+#EXTINF:3.0,
+41.aac
+#EXTINF:3.0,
+42.aac
+#EXTINF:3.0,
+43.aac
+"""
+            retried = []
+
+            def initial_download(_segments):
+                session._segment_path(40).write_bytes(b"audio")
+                session._segment_path(43).write_bytes(b"audio")
+                return 2
+
+            def failed_retry(sequence, _url):
+                retried.append(sequence)
+                raise OSError("chunk unavailable")
+
+            with (
+                patch.object(session, "_read_url", return_value=playlist),
+                patch.object(session, "_download_batch", side_effect=initial_download),
+                patch.object(session, "_download_segment", side_effect=failed_retry),
+            ):
+                session._download_history("https://cdn.example/replay.m3u8")
+
+            self.assertEqual(retried, [41, 42])
+            self.assertTrue(session._segment_path(40).is_file())
+            self.assertTrue(session._segment_path(43).is_file())
+            self.assertTrue(any("再試行対象: 2チャンク" in message for message in logs))
+
+    def test_final_repair_log_does_not_promise_another_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = archive.SpaceArchiveSession(
+                url="https://x.com/i/spaces/abcdefghijklm",
+                space_id="abcdefghijklm",
+                output_dir=Path(directory),
+                audio_format="source",
+                browser=None,
+                ytdlp_prefix=["yt-dlp"],
+                ffmpeg_location="C:/ffmpeg",
+                on_log=logs.append,
+                on_done=lambda *_: None,
+            )
+            session._temp_dir = Path(directory)
+            playlist = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:41\n#EXTINF:3.0,\n41.aac\n"
+            with (
+                patch.object(session, "_read_url", return_value=playlist),
+                patch.object(session, "_download_batch", return_value=1),
+            ):
+                session._repair_history_once("https://cdn.example/replay.m3u8", final=True)
+
+            self.assertTrue(any("最終補完で未取得: 1チャンク" in message for message in logs))
+            self.assertFalse(any("配信中は履歴を再確認" in message for message in logs))
+
     def test_live_endlist_triggers_finalization(self):
         with tempfile.TemporaryDirectory() as directory:
             session = archive.SpaceArchiveSession(

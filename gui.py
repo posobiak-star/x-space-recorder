@@ -19,7 +19,7 @@ import recorder
 
 
 APP_NAME = "X Space Recorder"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 FIREFOX_DOWNLOAD_URL = "https://www.mozilla.org/firefox/new/"
 
 
