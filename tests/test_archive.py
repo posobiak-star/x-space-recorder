@@ -2,12 +2,191 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import archive
 
 
 class ArchiveTests(unittest.TestCase):
+    def make_session(self, directory, *, logs=None, done=None):
+        return archive.SpaceArchiveSession(
+            url="https://x.com/i/spaces/abcdefghijklm", space_id="abcdefghijklm",
+            output_dir=Path(directory), audio_format="source", browser=None,
+            ytdlp_prefix=["yt-dlp"], ffmpeg_location="C:/ffmpeg",
+            on_log=logs.append if logs is not None else lambda _: None,
+            on_done=done if done is not None else lambda *_: None,
+        )
+
+    def test_progress_counts_duration_and_redownload_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory)
+            session._remember_playlist("https://cdn.example/history.m3u8", "#EXTM3U\n#EXTINF:2.5,title\nfirst.aac\n#EXTINF:1.25,\nsecond.aac\n")
+            with patch.object(session, "_read_url", return_value=b"audio"):
+                session._download_segment(0, "first")
+                session._download_segment(1, "second")
+                session._segment_path(0).unlink()
+                session._missing_known_segments()
+                session._download_segment(0, "first")
+            self.assertEqual(session.progress.downloaded_chunks, 2)
+            self.assertEqual(session.progress.downloaded_bytes, 10)
+            self.assertAlmostEqual(session.progress.audio_seconds, 3.75)
+
+    def test_derive_history_url_preserves_additional_query_parameters(self):
+        session = self.make_session("out")
+        with patch.object(session, "_read_url", return_value="#EXTM3U\nplaylist_123.m3u8\n") as read:
+            url = session._derive_live_replay_url("https://cdn.example/audio/dynamic_playlist.m3u8?type=live&token=abc%2B123")
+        self.assertEqual(url, "https://cdn.example/audio/playlist_123.m3u8?token=abc%2B123&type=replay")
+        self.assertEqual(read.call_args.args[0], "https://cdn.example/audio/master_playlist.m3u8?token=abc%2B123")
+
+    def test_failed_conversion_keeps_chunks_without_publishing_broken_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory) / ".recording-test"
+            session._temp_dir.mkdir()
+            session._segment_path(1).write_bytes(b"audio")
+
+            def failed_conversion(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"partial")
+                return SimpleNamespace(returncode=1, stderr="conversion failed")
+
+            with patch("archive.subprocess.run", side_effect=failed_conversion):
+                with self.assertRaises(archive.SpaceArchiveError):
+                    session._finalize("Space")
+            self.assertFalse((Path(directory) / "Space.m4a").exists())
+            self.assertTrue(session._segment_path(1).is_file())
+
+    def test_successful_conversion_preserves_existing_file_and_ignores_combined_aac(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory) / ".recording-test"
+            session._temp_dir.mkdir()
+            session._segment_path(1).write_bytes(b"audio")
+            (session._temp_dir / "combined.aac").write_bytes(b"old combined")
+            (Path(directory) / "Space.m4a").write_bytes(b"original")
+
+            def successful_conversion(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"converted")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch("archive.subprocess.run", side_effect=successful_conversion):
+                output = session._finalize("Space")
+            self.assertEqual(output.name, "Space (2).m4a")
+            self.assertEqual(output.read_bytes(), b"converted")
+            self.assertEqual((Path(directory) / "Space.m4a").read_bytes(), b"original")
+            self.assertFalse(session._temp_dir.exists())
+
+    def test_error_joins_live_worker_before_done_callback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stopped = threading.Event()
+            outcomes = []
+
+            def done(success, output, error):
+                self.assertTrue(stopped.is_set())
+                outcomes.append((success, output, error))
+
+            session = self.make_session(directory, done=done)
+            original_phase = session._set_phase
+
+            def fail_after_start(phase):
+                if phase == "live":
+                    raise RuntimeError("forced failure")
+                original_phase(phase)
+
+            def poll(_url):
+                session.cancel_event.wait(2)
+                stopped.set()
+
+            with (
+                patch.object(session, "_extract_info", return_value={"live_status": "is_live", "url": "live"}),
+                patch.object(session, "_derive_live_replay_url", return_value="history"),
+                patch.object(session, "_poll_live", side_effect=poll),
+                patch.object(session, "_download_history"),
+                patch.object(session, "_set_phase", side_effect=fail_after_start),
+            ):
+                session._run()
+            self.assertEqual(outcomes, [(False, None, "forced failure")])
+            self.assertTrue(session.cancel_event.is_set())
+
+    def test_initial_history_failure_keeps_live_recording_and_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repaired = threading.Event()
+            outcomes = []
+            session = self.make_session(directory, done=lambda *args: outcomes.append(args))
+
+            def repair(_history, _live):
+                session._segment_path(0).write_bytes(b"audio")
+                repaired.set()
+
+            def poll(_url):
+                repaired.wait(2)
+                session.stop()
+
+            with (
+                patch.object(session, "_extract_info", return_value={"live_status": "is_live", "url": "live"}),
+                patch.object(session, "_derive_live_replay_url", return_value="history"),
+                patch.object(session, "_poll_live", side_effect=poll),
+                patch.object(session, "_download_history", side_effect=OSError("temporary failure")),
+                patch.object(session, "_poll_history_repairs", side_effect=repair),
+                patch.object(session, "_finalize", return_value=Path(directory) / "Space.m4a"),
+            ):
+                session._run()
+            self.assertTrue(repaired.is_set())
+            self.assertTrue(outcomes[0][0])
+
+    def test_stop_before_audio_is_a_normal_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outcomes = []
+            session = self.make_session(directory, done=lambda *args: outcomes.append(args))
+            session.stop()
+            with patch.object(session, "_extract_info", side_effect=archive.SpaceArchiveCancelled("stopped")):
+                session._run()
+            self.assertEqual(outcomes, [(True, None, None)])
+            self.assertEqual(session.progress.phase, "cancelled")
+
+    def test_disk_failure_stops_batch_instead_of_retrying_it_as_a_network_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory)
+            with (
+                patch.object(session, "_read_url", return_value=b"audio") as read,
+                patch("archive.Path.write_bytes", side_effect=OSError("disk full")),
+            ):
+                with self.assertRaises(archive.SpaceArchiveStorageError):
+                    session._download_batch([(0, "audio")], workers=1)
+            self.assertEqual(read.call_count, 1)
+            self.assertTrue(session.cancel_event.is_set())
+            self.assertTrue(session.stop_event.is_set())
+
+    def test_unchanged_repair_failure_is_not_logged_every_poll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = self.make_session(directory, logs=logs)
+            session._temp_dir = Path(directory)
+            session._remember_segments([(0, "missing")])
+            body = "#EXTM3U\n#EXTINF:3.0,\nmissing.aac\n"
+            with (
+                patch.object(session, "_read_url", return_value=body),
+                patch.object(session, "_download_batch", return_value=1),
+            ):
+                session._repair_history_once("https://cdn.example/history")
+                session._repair_history_once("https://cdn.example/history")
+            self.assertEqual(sum("自動補完待ち:" in message for message in logs), 1)
+            self.assertEqual(sum("欠落を検知:" in message for message in logs), 1)
+
+    def test_new_live_edge_chunk_is_downloaded_without_false_gap_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            session = self.make_session(directory, logs=logs)
+            session._temp_dir = Path(directory)
+            session._remember_segments([(0, "saved")])
+            session._segment_path(0).write_bytes(b"audio")
+            body = "#EXTM3U\n#EXTINF:3.0,\nsaved.aac\n#EXTINF:3.0,\nnew.aac\n"
+            with patch.object(session, "_read_url", side_effect=lambda _url, *, binary=False, timeout=30: b"audio" if binary else body):
+                self.assertEqual(session._repair_history_once("https://cdn.example/history"), 1)
+            self.assertFalse(any("欠落" in message for message in logs))
+
     def test_parse_replay_playlist_uses_segment_sequence(self):
         body = """#EXTM3U
 #EXT-X-MEDIA-SEQUENCE:0
