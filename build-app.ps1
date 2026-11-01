@@ -25,6 +25,7 @@ try {
     & $VenvPython -m PyInstaller --noconfirm --clean --onefile --windowed `
         --name 'X Space Recorder' `
         --add-binary "$YtDlpExe;." `
+        --add-data "ytdlp_plugins;ytdlp_plugins" `
         gui.py
     if ($LASTEXITCODE -ne 0) {
         throw 'アプリのビルドに失敗しました。'

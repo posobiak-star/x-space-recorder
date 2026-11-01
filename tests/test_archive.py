@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,7 +39,7 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(session, "_read_url", return_value="#EXTM3U\nplaylist_123.m3u8\n") as read:
             url = session._derive_live_replay_url("https://cdn.example/audio/dynamic_playlist.m3u8?type=live&token=abc%2B123")
         self.assertEqual(url, "https://cdn.example/audio/playlist_123.m3u8?token=abc%2B123&type=replay")
-        self.assertEqual(read.call_args.args[0], "https://cdn.example/audio/master_playlist.m3u8?token=abc%2B123")
+        self.assertEqual(read.call_args_list[0].args[0], "https://cdn.example/audio/master_playlist.m3u8?token=abc%2B123")
 
     def test_failed_conversion_keeps_chunks_without_publishing_broken_audio(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -134,6 +135,80 @@ class ArchiveTests(unittest.TestCase):
                 session._run()
             self.assertTrue(repaired.is_set())
             self.assertTrue(outcomes[0][0])
+
+    def test_failure_without_audio_leaves_no_temporary_folder(self):
+        for info in (
+            {"live_status": "was_live", "url": ""},
+            {"live_status": "is_upcoming", "url": ""},
+        ):
+            with self.subTest(info=info), tempfile.TemporaryDirectory() as directory:
+                outcomes = []
+                session = self.make_session(directory, done=lambda *args: outcomes.append(args))
+                with patch.object(session, "_extract_info", return_value=info):
+                    session._run()
+                self.assertFalse(outcomes[0][0])
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_failure_with_audio_keeps_chunks_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outcomes = []
+            session = self.make_session(directory, done=lambda *args: outcomes.append(args))
+
+            def partial_history(_url):
+                session._segment_path(0).write_bytes(b"audio")
+                raise archive.SpaceArchiveError("failed")
+
+            with (
+                patch.object(session, "_extract_info", return_value={"live_status": "was_live", "url": "replay"}),
+                patch.object(session, "_download_history", side_effect=partial_history),
+            ):
+                session._run()
+            self.assertFalse(outcomes[0][0])
+            self.assertEqual(session.recovery_dir, session._temp_dir)
+            self.assertTrue(session._segment_path(0).is_file())
+
+    def test_final_repair_retries_temporary_failure(self):
+        session = self.make_session("out")
+        session._history_replay_url = "history"
+        with (
+            patch("archive.FINAL_REPAIR_RETRY_SECONDS", 0),
+            patch.object(session, "_repair_history_once", side_effect=[OSError("temporary"), 1]) as repair,
+        ):
+            session._final_repair("live")
+        self.assertEqual(repair.call_count, 2)
+
+    def test_final_repair_gives_up_after_limit_and_keeps_going_to_save(self):
+        logs = []
+        session = self.make_session("out", logs=logs)
+        session._history_replay_url = "history"
+        with (
+            patch("archive.FINAL_REPAIR_RETRY_SECONDS", 0),
+            patch.object(session, "_repair_history_once", side_effect=OSError("unavailable")) as repair,
+        ):
+            session._final_repair("live")
+        self.assertEqual(repair.call_count, archive.FINAL_REPAIR_ATTEMPTS)
+        self.assertTrue(any("最終補完用の履歴を確認できませんでした: unavailable" in message for message in logs))
+
+    def test_manual_stop_ends_final_repair_retries(self):
+        session = self.make_session("out")
+        session._history_replay_url = "history"
+
+        def stop_then_fail(*_args, **_kwargs):
+            session.stop()
+            raise OSError("temporary")
+
+        with patch.object(session, "_repair_history_once", side_effect=stop_then_fail) as repair:
+            session._final_repair("live")
+        self.assertEqual(repair.call_count, 1)
+
+    def test_disk_failure_is_not_retried_by_final_repair(self):
+        logs = []
+        session = self.make_session("out", logs=logs)
+        session._history_replay_url = "history"
+        with patch.object(session, "_repair_history_once", side_effect=archive.SpaceArchiveStorageError("disk full")) as repair:
+            session._final_repair("live")
+        self.assertEqual(repair.call_count, 1)
+        self.assertTrue(any("最終補完を中断しました: disk full" in message for message in logs))
 
     def test_stop_before_audio_is_a_normal_cancellation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -395,7 +470,137 @@ segment.aac
 
             self.assertTrue(session.stop_event.is_set())
 
-    def test_history_endlist_triggers_finalization(self):
+    def test_derive_history_url_follows_absolute_master_entry(self):
+        session = self.make_session("out")
+        master = "#EXTM3U\n/b/Transcoding/v1/hls/abc/playlist_123.m3u8\n"
+        missing = urllib.error.HTTPError("https://cdn.example/x", 404, "Not Found", None, None)
+        self.addCleanup(missing.close)
+        with patch.object(session, "_read_url", side_effect=[master, missing]):
+            url = session._derive_live_replay_url("https://cdn.example/x/audio-space/dynamic_playlist.m3u8?type=live")
+        self.assertEqual(url, "https://cdn.example/b/Transcoding/v1/hls/abc/playlist_123.m3u8?type=replay")
+
+    def test_derive_history_url_prefers_complete_replay_store(self):
+        session = self.make_session("out")
+        master = "#EXTM3U\n/b/Transcoding/v1/hls/tok/transcode/pdxa/replays/jwt/audio-space/playlist_123.m3u8\n"
+        with patch.object(session, "_read_url", return_value=master):
+            url = session._derive_live_replay_url("https://cdn.example/Transcoding/v1/hls/tok/non_transcode/atla/live/audio-space/dynamic_playlist.m3u8?type=live")
+        self.assertEqual(url, "https://cdn.example/Transcoding/v1/hls/tok/non_transcode/pdxa/replays/audio-space/playlist_123.m3u8?type=replay")
+
+    def test_derive_history_url_does_not_downgrade_on_temporary_error(self):
+        session = self.make_session("out")
+        master = "#EXTM3U\n/b/Transcoding/v1/hls/tok/transcode/pdxa/replays/jwt/audio-space/playlist_123.m3u8\n"
+        unavailable = urllib.error.HTTPError("https://cdn.example/x", 503, "Unavailable", None, None)
+        self.addCleanup(unavailable.close)
+        with patch.object(session, "_read_url", side_effect=[master, unavailable]):
+            with self.assertRaises(urllib.error.HTTPError):
+                session._derive_live_replay_url("https://cdn.example/x/audio-space/dynamic_playlist.m3u8?type=live")
+
+    def test_transcode_playlist_chunks_resolve_next_to_live_playlist(self):
+        session = self.make_session("out")
+        session._live_url = "https://cdn.example/x/audio-space/dynamic_playlist.m3u8?type=live"
+        body = "#EXTM3U\n#EXTINF:3.0,\nchunk_100_5_b.aac\n"
+        self.assertEqual(
+            session._remember_playlist("https://cdn.example/b/Transcoding/transcode/playlist.m3u8?type=replay", body),
+            [(5, "https://cdn.example/x/audio-space/chunk_100_5_b.aac")],
+        )
+
+    def test_history_repairs_always_read_the_newest_snapshot(self):
+        session = self.make_session("out")
+        session._live_url = "live"
+        seen = []
+
+        def repair(url):
+            seen.append(url)
+            if len(seen) == 2:
+                session.stop_event.set()
+
+        with (
+            patch("archive.HISTORY_REPAIR_INTERVAL_SECONDS", 0),
+            patch.object(session, "_derive_live_replay_url", side_effect=["snapshot-1", "snapshot-2"]),
+            patch.object(session, "_repair_history_once", side_effect=repair),
+        ):
+            session._poll_history_repairs("snapshot-0", "live")
+        self.assertEqual(seen, ["snapshot-1", "snapshot-2"])
+        self.assertEqual(session._history_replay_url, "snapshot-2")
+
+    def test_final_repair_prefers_newest_snapshot_and_falls_back_to_older_one(self):
+        session = self.make_session("out")
+        session._live_url = "live"
+        session._history_replay_url = "old"
+        with patch.object(session, "_derive_live_replay_url", return_value="new"), patch.object(session, "_repair_history_once") as repair:
+            session._final_repair("live")
+        repair.assert_called_once_with("new", final=True)
+        session._history_replay_url = "old"
+        with patch.object(session, "_derive_live_replay_url", side_effect=OSError("gone")), patch.object(session, "_repair_history_once") as repair:
+            session._final_repair("live")
+        repair.assert_called_once_with("old", final=True)
+
+    def test_space_without_replay_still_repairs_from_readable_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+
+            def poll(_url):
+                session._ended_without_replay = True
+                session.stop_event.set()
+
+            with (
+                patch.object(session, "_extract_info", return_value={"live_status": "is_live", "url": "live"}),
+                patch.object(session, "_derive_live_replay_url", return_value="history"),
+                patch.object(session, "_poll_live", side_effect=poll),
+                patch.object(session, "_download_history"),
+                patch.object(session, "_poll_history_repairs"),
+                patch.object(session, "_final_repair") as final_repair,
+                patch.object(session, "_finalize", return_value=Path(directory) / "Space.m4a"),
+            ):
+                session._run()
+            final_repair.assert_called_once_with("live")
+
+    def test_final_repair_retries_while_chunks_are_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory)
+            session._history_replay_url = "history"
+            session._remember_segments([(1, "chunk")])
+
+            def repair(*_args, **_kwargs):
+                if repair_calls.call_count == 2:
+                    session._segment_path(1).write_bytes(b"audio")
+                return 0
+
+            with (
+                patch("archive.FINAL_REPAIR_RETRY_SECONDS", 0),
+                patch.object(session, "_repair_history_once", side_effect=repair) as repair_calls,
+            ):
+                session._final_repair("live")
+            self.assertEqual(repair_calls.call_count, 2)
+
+    def test_public_replay_chunks_stay_next_to_their_own_playlist(self):
+        session = self.make_session("out")
+        session._live_url = "https://live.example/x/dynamic_playlist.m3u8?type=live"
+        body = "#EXTM3U\n#EXTINF:3.0,\nchunk_100_5_b.aac\n"
+        self.assertEqual(
+            session._remember_playlist("https://replay.example/y/playlist.m3u8?type=replay", body),
+            [(5, "https://replay.example/y/chunk_100_5_b.aac")],
+        )
+
+    def test_segment_number_is_read_from_any_chunk_suffix(self):
+        for name in ("chunk_100_7_a.aac", "chunk_100_7_b.aac", "chunk_100_7_b.aac?type=live"):
+            with self.subTest(name=name):
+                body = f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:3.0,\n{name}\n"
+                self.assertEqual(archive.SpaceArchiveSession.parse_playlist("https://cdn.example/p.m3u8", body)[0][0], 7)
+
+    def test_missing_chunk_is_not_retried_with_backoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.make_session(directory)
+            session._temp_dir = Path(directory)
+            missing = urllib.error.HTTPError("https://cdn.example/1.aac", 404, "Not Found", None, None)
+            self.addCleanup(missing.close)
+            with patch.object(session, "_read_url", side_effect=missing) as read:
+                with self.assertRaises(urllib.error.HTTPError):
+                    session._download_segment(1, "https://cdn.example/1.aac")
+            self.assertEqual(read.call_count, 1)
+
+    def test_history_endlist_does_not_end_live_recording(self):
         with tempfile.TemporaryDirectory() as directory:
             logs = []
             session = archive.SpaceArchiveSession(
@@ -416,10 +621,9 @@ segment.aac
             with patch.object(session, "_read_url", return_value=playlist):
                 session._repair_history_once("https://cdn.example/replay.m3u8")
 
-            self.assertTrue(session.stop_event.is_set())
-            self.assertTrue(any("履歴からSpaceの終了を検知" in message for message in logs))
+            self.assertFalse(session.stop_event.is_set())
 
-    def test_initial_history_endlist_triggers_finalization(self):
+    def test_initial_history_endlist_does_not_end_live_recording(self):
         with tempfile.TemporaryDirectory() as directory:
             logs = []
             session = archive.SpaceArchiveSession(
@@ -442,8 +646,8 @@ segment.aac
             ):
                 session._download_history("https://cdn.example/replay.m3u8", continuing_live=True)
 
-            self.assertTrue(session.stop_event.is_set())
-            self.assertTrue(any("履歴からSpaceの終了を検知" in message for message in logs))
+            self.assertFalse(session.stop_event.is_set())
+            self.assertTrue(any("ライブ音声を継続取得中" in message for message in logs))
 
     def test_status_check_keeps_live_space_running(self):
         logs = []

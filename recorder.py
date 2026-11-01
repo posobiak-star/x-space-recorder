@@ -53,6 +53,11 @@ def find_ffmpeg() -> str | None:
     return None
 
 
+def ytdlp_plugin_args() -> list[str]:
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return ["--plugin-dirs", str(bundle_dir / "ytdlp_plugins")]
+
+
 def yt_dlp_command(
     *,
     url: str,
@@ -67,7 +72,7 @@ def yt_dlp_command(
 ) -> list[str]:
     output_template = str(output_dir / f"{safe_prefix(space_id)}_%(title).100B.%(ext)s")
     command = [
-        *(ytdlp_prefix or [sys.executable, "-m", "yt_dlp"]),
+        *(ytdlp_prefix or [sys.executable, "-m", "yt_dlp", *ytdlp_plugin_args()]),
         "--ignore-config",
         "--no-playlist",
         "--newline",

@@ -48,13 +48,16 @@ def main():
         ended = threading.Event()
         lock = threading.Lock()
         requests = Counter()
-        fail_once = {"/playlist.m3u8", "/chunk_0_2_a.aac", "/chunk_0_7_a.aac"}
+        master_entry = "/b/Transcoding/v1/hls/tok/transcode/pdxa/replays/jwt/audio-space/playlist_1.m3u8"
+        store_dir = "/Transcoding/v1/hls/tok/non_transcode/pdxa/replays/audio-space"
+        history_path = f"{store_dir}/playlist_1.m3u8"
+        fail_once = {history_path, f"{store_dir}/chunk_0_2_b.aac", f"{store_dir}/chunk_0_7_b.aac"}
 
-        def playlist(numbers):
+        def playlist(numbers, *, finished=None):
             body = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
             for number in numbers:
-                body += f"#EXTINF:{chunk_duration},\nchunk_0_{number}_a.aac\n"
-            return (body + ("#EXT-X-ENDLIST\n" if ended.is_set() else "")).encode()
+                body += f"#EXTINF:{chunk_duration},\nchunk_0_{number}_b.aac\n"
+            return (body + ("#EXT-X-ENDLIST\n" if finished or (finished is None and ended.is_set()) else "")).encode()
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
@@ -69,12 +72,21 @@ def main():
                     self.send_error(503, "simulated transient failure")
                     return
                 if path == "/master_playlist.m3u8":
-                    content = b"#EXTM3U\nplaylist.m3u8\n"
-                elif path == "/playlist.m3u8":
+                    content = f"#EXTM3U\n{master_entry}\n".encode()
+                elif path == history_path:
+                    # X's live history is a finished-looking snapshot kept in the replay store.
+                    content = playlist(range(12), finished=True)
+                elif path == "/replay/playlist.m3u8":
                     content = playlist(range(12))
                 elif path == "/dynamic_playlist.m3u8":
                     content = playlist((9, 10, 11))
-                elif path.endswith(".aac"):
+                elif path.startswith("/b/") and path.endswith(".aac"):
+                    self.send_error(400)
+                    return
+                elif path.startswith((store_dir, "/replay/")) and path.endswith(".aac"):
+                    content = data
+                elif path.endswith(".aac") and any(path.endswith(f"_{number}_b.aac") for number in (9, 10, 11)):
+                    # The live store only serves the current edge here; older chunks must come from the replay store.
                     content = data
                 else:
                     self.send_error(404)
@@ -89,7 +101,7 @@ def main():
         server_thread.start()
         base_url = f"http://127.0.0.1:{server.server_port}"
         live_url = base_url + "/dynamic_playlist.m3u8?type=live"
-        history_url = base_url + "/playlist.m3u8?type=replay"
+        history_url = base_url + "/replay/playlist.m3u8?type=replay"
         logs = []
         sessions = []
         outcomes = []

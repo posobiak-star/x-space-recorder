@@ -43,6 +43,17 @@ class RecorderTests(unittest.TestCase):
             with patch.dict(os.environ, {"LOCALAPPDATA": directory}), patch("recorder.os.name", "nt"):
                 self.assertEqual(recorder.find_ffmpeg(), str(ffmpeg.parent))
 
+    def test_full_id_plugin_is_loaded_by_yt_dlp(self):
+        plugin_args = recorder.ytdlp_plugin_args()
+        self.assertEqual(plugin_args[0], "--plugin-dirs")
+        plugin = Path(plugin_args[1]) / "spaces_full_id" / "yt_dlp_plugins" / "extractor" / "spaces_full_id.py"
+        self.assertTrue(plugin.is_file())
+        command = recorder.yt_dlp_command(
+            url="https://x.com/i/spaces/abc", space_id="abc", output_dir=Path("out"), audio_format="source",
+            browser=None, cookies_file=None, ffmpeg_location="C:/ffmpeg/bin", verbose=False,
+        )
+        self.assertIn(plugin_args[1], command)
+
     @patch("recorder.safe_prefix", return_value="prefix")
     def test_command_uses_browser_and_source_format(self, _):
         command = recorder.yt_dlp_command(

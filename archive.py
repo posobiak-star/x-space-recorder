@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -19,7 +20,8 @@ from pathlib import Path
 from typing import Callable
 
 
-SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)_a\.aac(?:\?|$)")
+SEGMENT_SEQUENCE_RE = re.compile(r"_(\d+)_[a-z]+\.aac(?:\?|$)")
+PUBLIC_HISTORY_PATH_RE = re.compile(r"(/Transcoding/v1/hls/[^/]+)/transcode/([^/]+/[^/]+)/[^/]+/(audio-space/[^/]+)$")
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 HISTORY_REPAIR_INTERVAL_SECONDS = 5.0
 LIVE_POLL_INTERVAL_SECONDS = 1.5
@@ -27,6 +29,8 @@ SEGMENT_REQUEST_TIMEOUT_SECONDS = 10.0
 PLAYLIST_REQUEST_TIMEOUT_SECONDS = 10.0
 LIVE_STATUS_CHECK_AFTER_SECONDS = 30.0
 SPACE_INFO_TIMEOUT_SECONDS = 30.0
+FINAL_REPAIR_ATTEMPTS = 4
+FINAL_REPAIR_RETRY_SECONDS = 5.0
 
 
 class SpaceArchiveError(RuntimeError):
@@ -90,6 +94,7 @@ class SpaceArchiveSession:
         self._started_at = time.monotonic()
         self._finished_at: float | None = None
         self._temp_dir: Path | None = None
+        self._live_url: str | None = None
         self._history_replay_url: str | None = None
         self._status_replay_url: str | None = None
         self._status_live_url: str | None = None
@@ -268,8 +273,22 @@ class SpaceArchiveSession:
         ]
         if not playlist_paths:
             raise SpaceArchiveError("ライブ履歴のマスタープレイリストが空です")
-        playlist_name = Path(urllib.parse.urlparse(playlist_paths[0]).path).name
-        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, f"{directory}/{playlist_name}", urllib.parse.urlencode([*query, ("type", "replay")]), ""))
+        target = urllib.parse.urlsplit(urllib.parse.urljoin(master_url, playlist_paths[0]))
+        history_query = urllib.parse.urlencode([*query, ("type", "replay")])
+        candidates = [urllib.parse.urlunsplit((parts.scheme, parts.netloc, f"{directory}/{Path(target.path).name}", history_query, ""))]
+        public = PUBLIC_HISTORY_PATH_RE.search(target.path)
+        if public:
+            # The replay store holds every chunk, unlike the live store, and serves them next to this playlist.
+            public_path = f"{public[1]}/non_transcode/{public[2]}/{public[3]}"
+            candidates.insert(0, urllib.parse.urlunsplit((target.scheme, target.netloc, public_path, history_query, "")))
+        for candidate in candidates:
+            try:
+                self._read_url(candidate, timeout=PLAYLIST_REQUEST_TIMEOUT_SECONDS)
+                return candidate
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+        return urllib.parse.urlunsplit((target.scheme, target.netloc, target.path, history_query, ""))
 
     def _segment_path(self, sequence: int) -> Path:
         assert self._temp_dir is not None
@@ -281,7 +300,10 @@ class SpaceArchiveSession:
                 self._known_segments[sequence] = url
 
     def _remember_playlist(self, playlist_url: str, body: str) -> list[tuple[int, str]]:
-        segments = self.parse_playlist(playlist_url, body)
+        # A transcode playlist cannot serve its own chunks, so fall back to the live store.
+        uses_live_store = self._live_url and "/transcode/" in urllib.parse.urlsplit(playlist_url).path
+        base_url = self._live_url if uses_live_store else playlist_url
+        segments = self.parse_playlist(base_url, body)
         durations = []
         duration = 0.0
         for raw_line in body.splitlines():
@@ -385,10 +407,11 @@ class SpaceArchiveSession:
                     return True
                 except SpaceArchiveStorageError:
                     raise
-                except Exception:
+                except Exception as exc:
                     if self._cancel_requested():
                         return False
-                    if attempt == attempts - 1:
+                    # Some listed chunks never exist; the history repair retries them without backing off here.
+                    if attempt == attempts - 1 or (isinstance(exc, urllib.error.HTTPError) and exc.code == 404):
                         raise
                     self.cancel_event.wait(min(2**attempt, 8))
         finally:
@@ -403,9 +426,6 @@ class SpaceArchiveSession:
         segments = self._remember_playlist(playlist_url, body)
         if not segments:
             raise SpaceArchiveError("過去音声チャンクが見つかりませんでした")
-        if continuing_live and "#EXT-X-ENDLIST" in body and not self.stop_event.is_set():
-            self._log("履歴からSpaceの終了を検知しました。最終補完を開始します。")
-            self.stop_event.set()
         with self._claim_lock:
             duration = sum(self._segment_durations.get(sequence, 0) for sequence, _url in segments)
         self._log(f"過去音声を取得: {len(segments)}チャンク（約{duration / 60:.1f}分）")
@@ -444,9 +464,7 @@ class SpaceArchiveSession:
         segments = self._remember_playlist(playlist_url, body)
         if not segments:
             raise SpaceArchiveError("補完用の履歴プレイリストが空です")
-        if "#EXT-X-ENDLIST" in body and not self.stop_event.is_set():
-            self._log("履歴からSpaceの終了を検知しました。最終補完を開始します。")
-            self.stop_event.set()
+        # X marks the history as ended even during a live Space, so only the live playlist can signal the end.
         missing = self._missing_known_segments()
         if not missing:
             self._last_repair_pending = set()
@@ -456,7 +474,7 @@ class SpaceArchiveSession:
         # New chunks at the live edge are normal arrivals, not recording gaps.
         reported = {sequence for sequence, _url in missing if final or sequence in previous_known or sequence < previous_latest}
         previous_pending = self._last_repair_pending
-        if reported and (final or reported != previous_pending):
+        if reported and reported != previous_pending:
             self._log(f"欠落を検知: {len(reported)}チャンクを{stage}します…")
         self._download_batch(missing)
         remaining = self._missing_known_segments()
@@ -465,7 +483,7 @@ class SpaceArchiveSession:
         reported_repaired = len(reported) - len(reported_remaining)
         if reported_repaired:
             self._log(f"{stage}完了: {reported_repaired}チャンクを回収しました")
-        if reported_remaining and (final or reported_remaining != previous_pending):
+        if reported_remaining and reported_remaining != previous_pending:
             if final:
                 self._log(f"最終補完で未取得: {len(reported_remaining)}チャンク")
             else:
@@ -476,14 +494,46 @@ class SpaceArchiveSession:
         self._last_repair_pending = reported_remaining
         return repaired
 
+    def _final_repair(self, stream_url: str) -> None:
+        # The replay can lag right after a Space ends, and this is the last chance to fill gaps.
+        self._last_repair_pending = set()
+        for attempt in range(FINAL_REPAIR_ATTEMPTS):
+            failure: Exception | None = None
+            try:
+                if not self._status_replay_url:
+                    try:
+                        self._history_replay_url = self._derive_live_replay_url(self._live_url or stream_url)
+                    except Exception:
+                        # The live master can vanish once a Space ends; an older snapshot may still help.
+                        if not self._history_replay_url:
+                            raise
+                self._repair_history_once(self._status_replay_url or self._history_replay_url, final=True)
+                if not self._missing_known_segments():
+                    return
+            except SpaceArchiveStorageError as exc:
+                self._log(f"最終補完を中断しました: {exc}")
+                return
+            except Exception as exc:
+                failure = exc
+                if attempt == 0:
+                    self._log(f"最終補完の再試行待ち: {exc}")
+            if attempt == FINAL_REPAIR_ATTEMPTS - 1:
+                if failure:
+                    self._log(f"最終補完用の履歴を確認できませんでした: {failure}")
+                return
+            if self.cancel_event.wait(FINAL_REPAIR_RETRY_SECONDS):
+                return
+
     def _poll_history_repairs(self, playlist_url: str | None, dynamic_url: str | None = None) -> None:
         consecutive_errors = 0
         while not self.stop_event.wait(HISTORY_REPAIR_INTERVAL_SECONDS):
             try:
-                if not playlist_url:
-                    assert dynamic_url is not None
-                    playlist_url = self._derive_live_replay_url(dynamic_url)
+                # Each history playlist is a frozen snapshot, and newer ones get a new name.
+                live_url = self._live_url or dynamic_url
+                if live_url:
+                    playlist_url = self._derive_live_replay_url(live_url)
                     self._history_replay_url = playlist_url
+                assert playlist_url is not None
                 self._repair_history_once(playlist_url)
                 consecutive_errors = 0
             except Exception as exc:
@@ -536,6 +586,7 @@ class SpaceArchiveSession:
                     status_check_errors = 0
                     if status == "live" and self._status_live_url:
                         dynamic_url = self._status_live_url
+                        self._live_url = dynamic_url
                 except Exception as exc:
                     status_check_errors += 1
                     if status_check_errors in (1, 5):
@@ -587,7 +638,7 @@ class SpaceArchiveSession:
             source_gaps = (max(known_numbers) - min(known_numbers) + 1) - len(known_numbers)
             if source_gaps:
                 self._log(
-                    f"注意: Xが公開した履歴自体に{source_gaps}個のチャンク番号の飛びがあります"
+                    f"警告: {source_gaps}個のチャンク番号を取得・確認できませんでした。その部分の音声は抜けています"
                 )
 
         combined_aac = self._temp_dir / "combined.aac"
@@ -668,6 +719,7 @@ class SpaceArchiveSession:
             if live_status == "is_live":
                 if not stream_url:
                     raise SpaceArchiveError("進行中Spaceの音声URLを取得できませんでした。ログイン設定を確認してください")
+                self._live_url = stream_url
                 self._set_phase("history")
                 self._log("ライブ開始前まで遡り、現在音声を並行取得します。")
                 poller = threading.Thread(target=self._poll_live, args=(stream_url,), daemon=True)
@@ -699,16 +751,10 @@ class SpaceArchiveSession:
                     raise self._worker_error
                 if self.manual_stop_event.is_set():
                     self._log("録音を強制停止しました。最終補完を省略して保存します。")
-                elif not self._ended_without_replay:
+                # A Space without a public replay can still have its history readable for a while.
+                elif self._history_replay_url or not self._ended_without_replay:
                     self._set_phase("final_repair")
-                    try:
-                        final_url = self._status_replay_url or self._history_replay_url or self._derive_live_replay_url(stream_url)
-                        self._repair_history_once(
-                            final_url,
-                            final=True,
-                        )
-                    except Exception as exc:
-                        self._log(f"最終補完用の履歴を確認できませんでした: {exc}")
+                    self._final_repair(stream_url)
             elif live_status in ("was_live", "post_live"):
                 if not stream_url:
                     raise SpaceArchiveError(
@@ -743,7 +789,7 @@ class SpaceArchiveSession:
                 worker.join()
             if not success and self.recovery_dir:
                 self._log(f"取得済みの音声チャンクは残しています: {self._temp_dir}")
-            elif success and not output and self._temp_dir:
+            elif not output and self._temp_dir:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
             with self._claim_lock:
                 self._finished_at = time.monotonic()

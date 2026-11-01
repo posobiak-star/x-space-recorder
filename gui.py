@@ -21,7 +21,7 @@ import preferences
 
 
 APP_NAME = "X Space Recorder"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 FIREFOX_DOWNLOAD_URL = "https://www.mozilla.org/firefox/new/"
 HELP_URL = "https://github.com/posobiak-star/x-space-recorder#readme"
 MAX_LOG_LINES = 2000
@@ -136,16 +136,16 @@ def bundled_ytdlp_prefix() -> list[str]:
     bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     bundled = bundle_dir / "yt-dlp.exe"
     if bundled.is_file():
-        return [str(bundled)]
-    return [sys.executable, "-m", "yt_dlp"]
+        return [str(bundled), *recorder.ytdlp_plugin_args()]
+    return [sys.executable, "-m", "yt_dlp", *recorder.ytdlp_plugin_args()]
 
 
 class RecorderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry(f"900x{min(820, max(650, root.winfo_screenheight() - 100))}")
-        self.root.minsize(760, 650)
+        self.root.geometry("900x650")
+        self.root.minsize(760, 320)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.configure(background="#f1f5f9")
 
@@ -159,7 +159,8 @@ class RecorderApp:
         self._last_phase: str | None = None
         self._bar_mode: str | None = None
         self._settings_warning_shown = False
-        self._settings_expanded = True
+        self._settings_expanded = False
+        self._log_expanded = False
         self._status_tone = "info"
         self.settings_path = preferences.preferences_path()
         saved = preferences.load_preferences(self.settings_path, DEFAULT_RECORDINGS)
@@ -263,7 +264,7 @@ class RecorderApp:
         outer.bind("<Configure>", lambda _event: self._resize_page(outer))
         self.root.bind("<MouseWheel>", self._scroll_page)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(5, weight=1)
+        outer.rowconfigure(4, weight=1)
 
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -276,11 +277,7 @@ class RecorderApp:
         config = ttk.Frame(outer, style="Card.TFrame", padding=14)
         config.grid(row=1, column=0, sticky="ew")
         config.columnconfigure(0, weight=1)
-        config_header = ttk.Frame(config, style="Card.TFrame")
-        config_header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(config_header, text="X SpaceのURL", style="Card.TLabel").pack(side="left")
-        self.settings_toggle = ttk.Button(config_header, text="録音設定を閉じる", padding=(6, 1), command=lambda: self._toggle_settings(not self._settings_expanded))
-        self.settings_toggle.pack(side="right")
+        ttk.Label(config, text="X SpaceのURL", style="Card.TLabel").grid(row=0, column=0, sticky="w")
         input_row = ttk.Frame(config, style="Card.TFrame")
         input_row.grid(row=1, column=0, sticky="ew", pady=(4, 10))
         input_row.columnconfigure(0, weight=1)
@@ -291,9 +288,26 @@ class RecorderApp:
         self.paste_button = ttk.Button(input_row, text="貼り付け", command=self.paste_url)
         self.paste_button.grid(row=0, column=1, padx=(8, 0))
 
+        actions = ttk.Frame(config, style="Card.TFrame")
+        actions.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self.start_button = ttk.Button(actions, text="録音開始", style="Accent.TButton", command=self.start_recording)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(actions, text="停止して保存", style="Accent.TButton", command=self.stop_recording, state="disabled")
+        self.ffmpeg_button = ttk.Button(actions, text="FFmpegを導入", command=self.install_ffmpeg)
+        self.ffmpeg_button.pack(side="right")
+        ttk.Label(actions, textvariable=self.environment, style="Muted.TLabel").pack(side="right", padx=(0, 10))
+
+        settings_header = ttk.Frame(config, style="Card.TFrame")
+        settings_header.grid(row=3, column=0, sticky="ew")
+        settings_header.columnconfigure(0, weight=1)
+        self.summary_label = ttk.Label(settings_header, textvariable=self.settings_summary, style="Muted.TLabel", wraplength=560)
+        self.summary_label.grid(row=0, column=0, sticky="w")
+        self.settings_toggle = ttk.Button(settings_header, text="録音設定を閉じる", padding=(6, 1), command=lambda: self._toggle_settings(not self._settings_expanded))
+        self.settings_toggle.grid(row=0, column=1, padx=(8, 0))
+
         options = ttk.Frame(config, style="Card.TFrame")
         self.options_panel = options
-        options.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        options.grid(row=4, column=0, sticky="ew", pady=(10, 10))
         options.columnconfigure(0, weight=1, uniform="option")
         options.columnconfigure(1, weight=1, uniform="option")
 
@@ -348,10 +362,10 @@ class RecorderApp:
         options.bind("<Configure>", lambda event: self._resize_descriptions(event.width))
 
         self.folder_label = ttk.Label(config, text="保存先", style="Card.TLabel")
-        self.folder_label.grid(row=3, column=0, sticky="w")
+        self.folder_label.grid(row=5, column=0, sticky="w")
         folder = ttk.Frame(config, style="Card.TFrame")
         self.folder_panel = folder
-        folder.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        folder.grid(row=6, column=0, sticky="ew", pady=(4, 0))
         folder.columnconfigure(0, weight=1)
         ttk.Entry(folder, textvariable=self.output_dir, state="readonly").grid(
             row=0, column=0, sticky="ew"
@@ -359,9 +373,6 @@ class RecorderApp:
         self.folder_button = ttk.Button(folder, text="変更", command=self.choose_folder)
         self.folder_button.grid(row=0, column=1, padx=(8, 0))
         ttk.Button(folder, text="開く", command=self.open_folder).grid(row=0, column=2, padx=(8, 0))
-        self.summary_label = ttk.Label(config, textvariable=self.settings_summary, style="Muted.TLabel", wraplength=650)
-        self.summary_label.grid(row=5, column=0, sticky="ew")
-        self.summary_label.grid_remove()
 
         status_panel = ttk.Frame(outer, style="Card.TFrame", padding=14)
         status_panel.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -373,6 +384,7 @@ class RecorderApp:
         self.progress_bar = ttk.Progressbar(status_panel, mode="determinate", maximum=100)
         self.progress_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         metrics = ttk.Frame(status_panel, style="Card.TFrame")
+        self.metrics_panel = metrics
         metrics.grid(row=3, column=0, sticky="ew")
         for column, (label, value) in enumerate((("保存済み音声", self.audio_time), ("取得データ", self.data_size), ("処理時間", self.elapsed))):
             metrics.columnconfigure(column, weight=1, uniform="metric")
@@ -384,18 +396,8 @@ class RecorderApp:
         self.detail_label.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         status_panel.bind("<Configure>", lambda event: self._resize_status(event.width))
 
-        actions = ttk.Frame(outer)
-        actions.grid(row=3, column=0, sticky="ew", pady=12)
-        self.start_button = ttk.Button(actions, text="録音開始", style="Accent.TButton", command=self.start_recording)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(actions, text="停止して保存", command=self.stop_recording, state="disabled")
-        self.stop_button.pack(side="left", padx=(8, 0))
-        self.ffmpeg_button = ttk.Button(actions, text="FFmpegを導入", command=self.install_ffmpeg)
-        self.ffmpeg_button.pack(side="right")
-        ttk.Label(actions, textvariable=self.environment, style="PageMuted.TLabel").pack(side="right", padx=(0, 10))
-
         self.result_frame = ttk.Frame(outer, style="Card.TFrame", padding=10)
-        self.result_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        self.result_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         self.result_frame.columnconfigure(0, weight=1)
         ttk.Entry(self.result_frame, textvariable=self.result_path, state="readonly").grid(row=0, column=0, sticky="ew")
         self.play_button = ttk.Button(self.result_frame, text="再生", command=self.play_output)
@@ -405,19 +407,30 @@ class RecorderApp:
         self.result_frame.grid_remove()
 
         log_frame = ttk.Frame(outer)
-        log_frame.grid(row=5, column=0, sticky="nsew")
+        log_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
         log_header = ttk.Frame(log_frame)
-        log_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        log_header.grid(row=0, column=0, sticky="ew")
         ttk.Label(log_header, text="実行ログ", style="PageMuted.TLabel").pack(side="left")
         ttk.Button(log_header, text="ログをコピー", command=self.copy_log, padding=(8, 2)).pack(side="right")
-        self.log = tk.Text(log_frame, height=5, wrap="word", state="disabled", font=("Yu Gothic UI", 9), background=self.colors["card"], foreground=self.colors["text"], insertbackground=self.colors["text"], selectbackground=self.colors["accent"], selectforeground=self.colors["accent_text"], relief="flat", padx=10, pady=8)
-        self.log.grid(row=1, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.log_toggle = ttk.Button(log_header, text="ログを表示", command=lambda: self._toggle_log(not self._log_expanded), padding=(8, 2))
+        self.log_toggle.pack(side="right", padx=(0, 8))
+        self.log_body = ttk.Frame(log_frame)
+        self.log_body.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
+        self.log_body.columnconfigure(0, weight=1)
+        self.log_body.rowconfigure(0, weight=1)
+        self.log = tk.Text(self.log_body, height=10, wrap="word", state="disabled", font=("Yu Gothic UI", 9), background=self.colors["card"], foreground=self.colors["text"], insertbackground=self.colors["text"], selectbackground=self.colors["accent"], selectforeground=self.colors["accent_text"], relief="flat", padx=10, pady=8)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(self.log_body, orient="vertical", command=self.log.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
         self._configure_log_tags()
+
+        self._page = outer
+        self._show_progress_details(False)
+        self._toggle_log(False)
+        self._toggle_settings(False)
 
     def _resize_descriptions(self, width: int) -> None:
         for label in (self.format_description, self.login_description):
@@ -438,9 +451,30 @@ class RecorderApp:
         for widget in (self.options_panel, self.folder_label, self.folder_panel):
             widget.grid() if expanded else widget.grid_remove()
         self.settings_toggle.configure(text="録音設定を閉じる" if expanded else "録音設定を表示")
-        self.settings_summary.set(f"{self.audio_format.get()}  /  {self.browser.get()}\n保存先: {self.output_dir.get()}")
-        self.summary_label.grid_remove() if expanded else self.summary_label.grid()
+        self.settings_summary.set("録音設定" if expanded else f"{self.audio_format.get()}  /  {self.browser.get()}  /  保存先: {self.output_dir.get()}")
         self.canvas.yview_moveto(0)
+        self._fit_window()
+
+    def _toggle_log(self, expanded: bool) -> None:
+        self._log_expanded = expanded
+        self.log_body.grid() if expanded else self.log_body.grid_remove()
+        self.log_toggle.configure(text="ログを閉じる" if expanded else "ログを表示")
+        if expanded:
+            self.log.see("end")
+        self._fit_window()
+
+    def _show_progress_details(self, visible: bool) -> None:
+        for widget in (self.title_label, self.progress_bar, self.metrics_panel):
+            widget.grid() if visible else widget.grid_remove()
+        self._fit_window()
+
+    def _fit_window(self) -> None:
+        # Sections open and close, so follow their height instead of leaving blank space.
+        if not hasattr(self, "_page") or self.root.state() != "normal":
+            return
+        self.root.update_idletasks()
+        height = min(self._page.winfo_reqheight(), self.root.winfo_screenheight() - 100)
+        self.root.geometry(f"{max(self.root.winfo_width(), 760)}x{height}")
 
     def _resize_status(self, width: int) -> None:
         self.title_label.configure(wraplength=max(200, width - 28))
@@ -498,6 +532,9 @@ class RecorderApp:
         self.format_combo.configure(state="disabled" if busy else "readonly")
         self.login_combo.configure(state="disabled" if busy else "readonly")
         self.stop_button.configure(state="normal" if self.session else "disabled")
+        shown, hidden = (self.stop_button, self.start_button) if self.session else (self.start_button, self.stop_button)
+        hidden.pack_forget()
+        shown.pack(side="left")
         self._update_environment()
 
     def _update_environment(self) -> None:
@@ -681,6 +718,7 @@ class RecorderApp:
                 pass
         except (OSError, ValueError) as exc:
             self._show_error(f"保存先に書き込めません。別のフォルダを選択してください: {exc}")
+            self._toggle_settings(True)
             return
         self._save_preferences()
         self.url.set(url)
@@ -704,6 +742,7 @@ class RecorderApp:
         )
         self._set_busy(True)
         self._toggle_settings(False)
+        self._show_progress_details(True)
         self._render_progress(self.session.progress)
         keep_system_awake(True)
         self.append_log(
@@ -716,6 +755,7 @@ class RecorderApp:
             keep_system_awake(False)
             self.session = None
             self._set_busy(False)
+            self._show_progress_details(False)
             self._show_error(f"録音処理を開始できませんでした: {exc}")
 
     def stop_recording(self) -> None:
@@ -736,6 +776,9 @@ class RecorderApp:
                 event, value = self.events.get_nowait()
                 if event == "log":
                     self.append_log(str(value))
+                    # Errors and lost audio must not stay hidden in a closed log.
+                    if not self._log_expanded and any(word in str(value) for word in ("エラー:", "警告:")):
+                        self._toggle_log(True)
                 elif event == "done":
                     keep_system_awake(False)
                     success, path, error = value
@@ -750,6 +793,7 @@ class RecorderApp:
                         self.play_button.configure(state="normal")
                         self.reveal_button.configure(text="ファイルを表示")
                         self.result_frame.grid()
+                        self._fit_window()
                     elif error:
                         self.status_detail.set(str(error))
                         if self.recovery_folder:
@@ -757,9 +801,17 @@ class RecorderApp:
                             self.play_button.configure(state="disabled")
                             self.reveal_button.configure(text="取得済みデータを表示")
                             self.result_frame.grid()
+                            self._fit_window()
                     if self.close_when_done:
-                        self._shutdown()
-                        return
+                        if success:
+                            self._shutdown()
+                            return
+                        # Stay open so a failed save is never mistaken for a completed one.
+                        self.close_when_done = False
+                        message = f"音声を保存できなかったため、アプリを閉じませんでした。\n\n{error}"
+                        if self.recovery_folder:
+                            message += f"\n\n取得済みの音声チャンク:\n{self.recovery_folder}"
+                        messagebox.showerror(APP_NAME, message)
                 elif event == "ffmpeg_done":
                     returncode, error = value
                     self.installing_ffmpeg = False

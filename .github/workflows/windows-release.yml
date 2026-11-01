@@ -6,7 +6,7 @@ on:
       tag:
         description: Draft release tag to upload assets to
         required: true
-        default: v1.3.0
+        default: v1.3.1
 
 permissions:
   contents: write
@@ -47,6 +47,7 @@ jobs:
             --windowed `
             --name "X Space Recorder" `
             --add-binary ".tools/yt-dlp.exe;." `
+            --add-data "ytdlp_plugins;ytdlp_plugins" `
             gui.py
 
       - name: Package ZIP

@@ -73,6 +73,87 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertEqual(str(self.app.stop_button.cget("state")), "disabled")
         self.assertEqual(self.app.status.get(), "保存完了")
 
+    def test_idle_screen_hides_settings_progress_and_log(self):
+        self.assertFalse(self.app._settings_expanded)
+        self.assertEqual(self.app.options_panel.grid_info(), {})
+        self.assertEqual(self.app.metrics_panel.grid_info(), {})
+        self.assertEqual(self.app.progress_bar.grid_info(), {})
+        self.assertEqual(self.app.log_body.grid_info(), {})
+        self.assertNotEqual(self.app.status_label.grid_info(), {})
+        self.assertIn("保存先:", self.app.settings_summary.get())
+
+    def test_start_and_stop_buttons_swap_and_progress_appears(self):
+        session = Mock()
+        session.progress = archive.ArchiveProgress("live", "Space", 2, 10, 100, 6, 1)
+        session.recovery_dir = None
+        self.assertEqual(self.app.start_button.winfo_manager(), "pack")
+        self.assertEqual(self.app.stop_button.winfo_manager(), "")
+        self.app.url.set("https://x.com/i/spaces/abcdefghijklm")
+        with patch("gui.archive.SpaceArchiveSession", return_value=session):
+            self.app.start_recording()
+        self.assertEqual(self.app.start_button.winfo_manager(), "")
+        self.assertEqual(self.app.stop_button.winfo_manager(), "pack")
+        self.assertNotEqual(self.app.metrics_panel.grid_info(), {})
+        self.app.events.put(("done", (True, Path(self.directory.name) / "Space.m4a", None)))
+        self.app._drain_events()
+        self.assertEqual(self.app.start_button.winfo_manager(), "pack")
+        self.assertEqual(self.app.stop_button.winfo_manager(), "")
+        self.assertNotEqual(self.app.metrics_panel.grid_info(), {})
+
+    def test_log_opens_only_for_errors_and_warnings(self):
+        for line, expected in (
+            ("音声チャンク取得済み: 100\n", False),
+            ("注意: 手動停止のため省略します\n", False),
+            ("履歴の自動補完待ち: timeout\n", False),
+            ("警告: 1個の音声チャンクを補完できませんでした\n", True),
+            ("エラー: 保存できませんでした\n", True),
+        ):
+            with self.subTest(line=line):
+                self.app._toggle_log(False)
+                self.app.events.put(("log", line))
+                self.app._drain_events()
+                self.assertEqual(self.app._log_expanded, expected)
+
+    def test_invalid_url_shows_message_without_opening_log(self):
+        self.app.url.set("https://example.com/")
+        self.app.start_recording()
+        self.assertFalse(self.app._log_expanded)
+        self.assertIn("X SpaceのURL", self.app.status_detail.get())
+
+    def test_failed_save_while_closing_keeps_window_open_and_shows_error(self):
+        recovery = Path(self.directory.name) / ".recording-test"
+        session = Mock()
+        session.progress = archive.ArchiveProgress("error", "Space", 10, 10, 100, 30, 3)
+        session.recovery_dir = recovery
+        self.app.session = session
+        self.app.close_when_done = True
+        self.app.events.put(("done", (False, None, "disk full")))
+        with (
+            patch.object(self.app, "_shutdown") as shutdown,
+            patch("gui.messagebox.showerror") as showerror,
+        ):
+            self.app._drain_events()
+        shutdown.assert_not_called()
+        self.assertFalse(self.app.close_when_done)
+        message = showerror.call_args.args[1]
+        self.assertIn("disk full", message)
+        self.assertIn(str(recovery), message)
+
+    def test_successful_save_while_closing_closes_the_app(self):
+        session = Mock()
+        session.progress = archive.ArchiveProgress("done", "Space", 10, 10, 100, 30, 3)
+        session.recovery_dir = None
+        self.app.session = session
+        self.app.close_when_done = True
+        self.app.events.put(("done", (True, Path(self.directory.name) / "Space.m4a", None)))
+        with (
+            patch.object(self.app, "_shutdown") as shutdown,
+            patch("gui.messagebox.showerror") as showerror,
+        ):
+            self.app._drain_events()
+        shutdown.assert_called_once()
+        showerror.assert_not_called()
+
     def test_unwritable_folder_does_not_start_a_recording(self):
         self.app.url.set("https://x.com/i/spaces/abcdefghijklm")
         with (
@@ -83,6 +164,7 @@ class GuiWorkflowTests(unittest.TestCase):
         session.assert_not_called()
         self.assertIsNone(self.app.session)
         self.assertIn("保存先に書き込めません", self.app.status_detail.get())
+        self.assertTrue(self.app._settings_expanded)
 
     def test_ffmpeg_installation_blocks_parallel_recording(self):
         self.app.installing_ffmpeg = True
